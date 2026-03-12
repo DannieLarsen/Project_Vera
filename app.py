@@ -774,29 +774,45 @@ class ChatWindow(QMainWindow):
         if w.get("width") and w.get("height"):
             self.resize(w["width"], w["height"])
         sidebar_cfg = cfg.get("sidebar", {})
-        self._sidebar_width   = sidebar_cfg.get("width", 260)
+        self._sidebar_width     = sidebar_cfg.get("width", 260) or 260
         self._sidebar_collapsed = sidebar_cfg.get("collapsed", False)
-        self._sidebar.setFixedWidth(self._sidebar_width if not self._sidebar_collapsed else 0)
+        actual_w = 0 if self._sidebar_collapsed else self._sidebar_width
+        self._sidebar.setMinimumWidth(actual_w)
+        self._sidebar.setMaximumWidth(actual_w)
         self._collapse_btn.setText("▶" if self._sidebar_collapsed else "◀")
+        self._burger_btn.setToolTip(
+            "Show history panel  (Ctrl+\\)" if self._sidebar_collapsed
+            else "Hide history panel  (Ctrl+\\)"
+        )
         self._last_session_id = cfg.get("chat", {}).get("current_session_id", "")
 
     # ── Sidebar toggle ────────────────────────────────────────────────────────
     def _toggle_sidebar(self):
         self._sidebar_collapsed = not self._sidebar_collapsed
+        # Preserve last non-zero width so expand restores correct size
+        if not self._sidebar_collapsed and self._sidebar_width == 0:
+            self._sidebar_width = 260
         target_w = 0 if self._sidebar_collapsed else self._sidebar_width
-        anim = QPropertyAnimation(self._sidebar, b"minimumWidth", self)
-        anim.setDuration(220)
-        anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
-        anim.setEndValue(target_w)
+        start_w  = self._sidebar.width()
+
+        anim  = QPropertyAnimation(self._sidebar, b"minimumWidth", self)
         anim2 = QPropertyAnimation(self._sidebar, b"maximumWidth", self)
-        anim2.setDuration(220)
-        anim2.setEasingCurve(QEasingCurve.Type.InOutQuad)
-        anim2.setEndValue(target_w)
-        anim.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
-        anim2.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
-        self._collapse_btn.setText("▶" if self._sidebar_collapsed else "◀")
+        for a in (anim, anim2):
+            a.setDuration(220)
+            a.setEasingCurve(QEasingCurve.Type.InOutQuad)
+            a.setStartValue(start_w)
+            a.setEndValue(target_w)
+            a.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+
+        # Update burger tooltip; inner collapse btn mirrors state
+        collapsed = self._sidebar_collapsed
+        self._burger_btn.setToolTip(
+            "Show history panel  (Ctrl+\\)" if collapsed
+            else "Hide history panel  (Ctrl+\\)"
+        )
+        self._collapse_btn.setText("▶" if collapsed else "◀")
         self._collapse_btn.setToolTip(
-            "Expand sidebar  (Ctrl+\\)" if self._sidebar_collapsed
+            "Expand sidebar  (Ctrl+\\)" if collapsed
             else "Collapse sidebar  (Ctrl+\\)"
         )
 
@@ -1194,6 +1210,25 @@ class ChatWindow(QMainWindow):
         close_btn.setToolTip("Close")
         close_btn.clicked.connect(self.close)
 
+        # Burger button — always visible, toggles sidebar
+        self._burger_btn = QPushButton("☰")
+        self._burger_btn.setFixedSize(32, 32)
+        self._burger_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._burger_btn.setToolTip("Toggle history panel  (Ctrl+\\)")
+        self._burger_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; border: none;
+                color: {TEXT_MUTED}; font-size: 18px;
+                border-radius: 6px; padding: 0;
+            }}
+            QPushButton:hover {{
+                background-color: rgba(232,102,10,0.15); color: {ACCENT};
+            }}
+        """)
+        self._burger_btn.clicked.connect(self._toggle_sidebar)
+
+        h_layout.addWidget(self._burger_btn)
+        h_layout.addSpacing(4)
         h_layout.addWidget(dot)
         h_layout.addSpacing(6)
         h_layout.addWidget(title)
