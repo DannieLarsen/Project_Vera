@@ -1,0 +1,1197 @@
+"""
+Project Vera — Local AI Desktop Chatbot
+Powered by Microsoft Foundry Local
+License: Apache 2.0 (no cost, no cloud)
+"""
+
+import sys
+import os
+import ctypes
+import threading
+import re
+import time
+from datetime import datetime
+from pathlib import Path
+
+# ── Tell Windows to use our icon in the taskbar (not python.exe's icon) ──────
+if sys.platform == "win32":
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "Vera.ProjectVera.1"
+        )
+    except Exception:
+        pass
+
+from PySide6.QtCore import Qt, Signal, QObject, QThread, QPoint, QTimer
+from PySide6.QtGui import QFont, QColor, QPalette, QTextCursor, QIcon
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout,
+    QHBoxLayout, QTextEdit, QLineEdit, QPushButton,
+    QLabel, QSizePolicy, QScrollArea, QFrame, QGraphicsDropShadowEffect,
+    QComboBox
+)
+from openai import OpenAI
+
+# ── Foundry Local connection ──────────────────────────────────────────────────
+# Port is dynamic — discovered at runtime via foundry-local-sdk.
+MODEL_NAME = "qwen2.5-1.5b-instruct-generic-cpu:1"  # fallback only
+
+SYSTEM_PROMPT = (
+    "You are a helpful, concise AI assistant named James. "
+    "Answer clearly and accurately. "
+    "Use markdown for code blocks when relevant."
+)
+
+# ── OpenClaw-inspired color palette ──────────────────────────────────────────
+BG_MAIN      = "#1a1a1a"   # near-black background
+BG_PANEL     = "#242424"   # slightly lighter panel
+BG_INPUT     = "#2e2e2e"   # input field background
+BG_USER_MSG  = "#2c2c2c"   # user bubble
+BG_BOT_MSG   = "#1f1f1f"   # assistant bubble
+ACCENT       = "#e8660a"   # OpenClaw orange
+ACCENT_HOVER = "#ff7a1a"   # lighter orange on hover
+TEXT_PRIMARY = "#f0f0f0"   # main text
+TEXT_MUTED   = "#888888"   # timestamps / labels
+BORDER       = "#3a3a3a"   # subtle borders
+
+# ── Foundry service manager (using official foundry-local-sdk) ────────────────
+class FoundryManager(QObject):
+    """Manages the Foundry Local service via the official Python SDK.
+    Handles service start, model load/unload, and dynamic port discovery."""
+    status_update = Signal(str, str)   # (text, colour)
+    ready         = Signal()
+    failed        = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.model: str = ""          # currently loaded model alias/id
+        self._sdk = None               # FoundryLocalManager instance
+        self.endpoint: str = ""        # e.g. http://127.0.0.1:PORT/v1
+        self.api_key: str = "OPENAI_API_KEY"
+
+    # ── called in a QThread ──────────────────────────────────────────────────
+    def start_foundry(self):
+        """Initialise the SDK (auto-starts the service) and discover the port."""
+        try:
+            from foundry_local import FoundryLocalManager
+        except ImportError:
+            self.failed.emit(
+                "The 'foundry-local-sdk' Python package is not installed.\n"
+                "Run:  pip install foundry-local-sdk"
+            )
+            return
+
+        self.status_update.emit("● Starting Foundry Local service…", "#e8660a")
+        try:
+            # bootstrap=True starts the service if it isn't running.
+            # We don't pass a model — the user picks one from the dropdown.
+            self._sdk = FoundryLocalManager(bootstrap=True)
+            self.endpoint = self._sdk.endpoint   # http://127.0.0.1:PORT/v1
+            self.api_key  = self._sdk.api_key
+        except Exception as e:
+            self.failed.emit(
+                f"Could not start Foundry Local:\n{e}\n\n"
+                "Make sure Foundry Local is installed:\n"
+                "  winget install Microsoft.FoundryLocal"
+            )
+            return
+
+        self.ready.emit()
+
+    def list_cached(self) -> list:
+        """Return the list of locally cached model info objects."""
+        if not self._sdk:
+            return []
+        try:
+            return self._sdk.list_cached_models()
+        except Exception:
+            return []
+
+    def load_model(self, alias_or_id: str):
+        """Load a model into the running service. Blocks until ready."""
+        if not self._sdk:
+            raise RuntimeError("Foundry SDK not initialised")
+        self._sdk.load_model(alias_or_id)
+        self.model = alias_or_id
+
+    def unload_model(self):
+        """Unload the currently loaded model."""
+        if self._sdk and self.model:
+            try:
+                self._sdk.unload_model(self.model)
+            except Exception:
+                pass
+            self.model = ""
+
+    def stop_foundry(self):
+        """Clean up: unload the model (service keeps running for other apps)."""
+        self.unload_model()
+
+
+# ── Model name display helper ─────────────────────────────────────────────────
+def _model_display_name(alias_or_id: str) -> str:
+    """Convert a Foundry alias or model ID to a short display name.
+    e.g. 'qwen2.5-7b' → 'Qwen2.5-7b'  (aliases are already short)."""
+    name = re.sub(r":\d+$", "", alias_or_id)
+    name = re.sub(r"-generic-(?:cpu|gpu)", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"-instruct$", "", name, flags=re.IGNORECASE)
+    return name[:1].upper() + name[1:] if name else alias_or_id
+
+
+# ── Model list worker ─────────────────────────────────────────────────────────
+class ModelListWorker(QObject):
+    """Discovers all models cached locally via the foundry-local-sdk."""
+    models_ready = Signal(list)   # list of (alias, model_id) tuples
+
+    def __init__(self, fm: FoundryManager):
+        super().__init__()
+        self._fm = fm
+
+    def run(self):
+        models: list[tuple[str, str]] = []
+        try:
+            for m in self._fm.list_cached():
+                models.append((m.alias, m.id))
+        except Exception:
+            pass
+        self.models_ready.emit(models)
+
+
+# ── Model switch worker ───────────────────────────────────────────────────────
+class ModelSwitchWorker(QObject):
+    """Unloads the current model and loads a new one via the SDK."""
+    status_update = Signal(str, str)
+    done          = Signal(str)   # emits the new model alias on success
+    failed        = Signal(str)
+
+    def __init__(self, fm: FoundryManager, old_model: str, new_model: str):
+        super().__init__()
+        self._fm        = fm
+        self._old_model = old_model
+        self._new_model = new_model
+
+    def run(self):
+        if self._old_model:
+            self.status_update.emit("● Stopping current model…", "#e8660a")
+            self._fm.unload_model()
+
+        self.status_update.emit("● Loading model…", "#e8660a")
+        try:
+            self._fm.load_model(self._new_model)
+        except Exception as e:
+            self.failed.emit(f"Could not load '{self._new_model}': {e}")
+            return
+
+        self.done.emit(self._new_model)
+
+
+# ── Streaming worker ──────────────────────────────────────────────────────────
+class StreamWorker(QObject):
+    """Runs in a QThread. Emits one signal per token, then finished."""
+    token_received = Signal(str)
+    finished       = Signal()
+    error_occurred = Signal(str)
+
+    def __init__(self, client: OpenAI, messages: list, model_name: str = MODEL_NAME):
+        super().__init__()
+        self.client     = client
+        self.messages   = messages
+        self.model_name = model_name
+
+    def run(self):
+        try:
+            stream = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=self.messages,
+                stream=True,
+                temperature=0.7,
+                max_tokens=2048,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    self.token_received.emit(delta)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+        finally:
+            self.finished.emit()
+
+
+# ── Startup health-check worker ──────────────────────────────────────────────
+class HealthCheckWorker(QObject):
+    status_update = Signal(str, str)
+    connected    = Signal()
+    disconnected = Signal()
+
+    def __init__(self, client: OpenAI, model_name: str = MODEL_NAME):
+        super().__init__()
+        self.client     = client
+        self.model_name = model_name
+
+    def run(self):
+        # SDK load_model() is synchronous — the model should be ready.
+        # A brief retry loop covers any transient HTTP delay.
+        for attempt in range(15):
+            try:
+                self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": "."}],
+                    max_tokens=1,
+                    stream=False,
+                )
+                self.connected.emit()
+                return
+            except Exception:
+                elapsed = attempt + 1
+                self.status_update.emit(
+                    f"● Checking model… ({elapsed}s)", "#e8660a"
+                )
+                if attempt < 14:
+                    time.sleep(1)
+        self.disconnected.emit()
+
+
+# ── Message bubble widget ─────────────────────────────────────────────────────
+class MessageBubble(QFrame):
+    """A single chat message bubble."""
+
+    def __init__(self, role: str, parent=None):
+        super().__init__(parent)
+        self.role = role
+        self._setup_ui()
+
+    def _setup_ui(self):
+        is_user = self.role == "user"
+
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setStyleSheet(f"""
+            QFrame {{
+                background-color: {BG_USER_MSG if is_user else BG_BOT_MSG};
+                border-radius: 10px;
+                border: 1px solid {BORDER};
+            }}
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(4)
+
+        # Role label
+        role_label = QLabel("You" if is_user else "Assistant")
+        role_label.setStyleSheet(f"""
+            color: {ACCENT if is_user else TEXT_MUTED};
+            font-size: 11px;
+            font-weight: 600;
+            background: transparent;
+            border: none;
+        """)
+        layout.addWidget(role_label)
+
+        # Message text
+        self.text_edit = QTextEdit()
+        self.text_edit.setReadOnly(True)
+        self.text_edit.setFrameShape(QFrame.Shape.NoFrame)
+        self.text_edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.text_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.text_edit.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Minimum
+        )
+        self.text_edit.setStyleSheet(f"""
+            QTextEdit {{
+                color: {TEXT_PRIMARY};
+                background-color: transparent;
+                border: none;
+                font-size: 14px;
+                line-height: 1.5;
+            }}
+        """)
+        self.text_edit.document().contentsChanged.connect(self._adjust_height)
+        layout.addWidget(self.text_edit)
+
+    def _adjust_height(self):
+        doc = self.text_edit.document()
+        # Force reflow at the current visible width so height is accurate
+        width = self.text_edit.viewport().width()
+        if width > 0:
+            doc.setTextWidth(width)
+        doc_height = int(doc.size().height())
+        self.text_edit.setFixedHeight(max(doc_height + 4, 24))
+        self.updateGeometry()
+
+    def append_text(self, text: str):
+        cursor = self.text_edit.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(text)
+        self.text_edit.setTextCursor(cursor)
+        self._adjust_height()
+
+    def set_text(self, text: str):
+        self.text_edit.setPlainText(text)
+        self._adjust_height()
+
+
+# ── Main window ───────────────────────────────────────────────────────────────
+class ChatWindow(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Project Vera")
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setMinimumSize(720, 560)
+        self.resize(900, 680)
+        self._drag_pos = QPoint()
+        self.setAcceptDrops(True)
+
+        # OpenAI client — created after the SDK discovers the dynamic port
+        self.client: OpenAI | None = None
+
+        # Conversation history sent to the model (in-session only)
+        self.history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        # Active thread / worker (kept as attrs to avoid GC)
+        self._thread = None
+        self._worker = None
+        self._current_bubble: MessageBubble | None = None
+
+        # Pending file attachment (staged by drag-and-drop, sent with next message)
+        self._pending_attachment: dict | None = None  # {name, content, display}
+
+        # Active model (set when the user selects from the combo box)
+        self._active_model: str = ""      # alias used for load/unload
+        self._active_model_id: str = ""   # full ID used for chat completions
+        self._model_map:    dict = {}     # display_name -> alias
+        self._id_map:       dict = {}     # alias -> model_id
+
+        self._setup_ui()
+        self._apply_theme()
+        self._start_foundry()
+
+    # ── Foundry lifecycle ─────────────────────────────────────────────────────
+    def _start_foundry(self):
+        """Launch Foundry service; model is loaded when the user selects one."""
+        self._fm_thread = QThread()
+        self._fm = FoundryManager()
+        self._fm.moveToThread(self._fm_thread)
+        self._fm_thread.started.connect(self._fm.start_foundry)
+        self._fm.status_update.connect(self._on_foundry_status)
+        self._fm.ready.connect(self._on_foundry_ready)
+        self._fm.failed.connect(self._on_foundry_failed)
+        self._fm.ready.connect(self._fm_thread.quit)
+        self._fm.failed.connect(self._fm_thread.quit)
+        self._fm_thread.finished.connect(self._fm_thread.deleteLater)
+        self._fm_thread.start()
+
+    def _on_foundry_status(self, text: str, colour: str):
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(
+            f"color: {colour}; font-size: 11px; background: transparent;"
+        )
+
+    def _on_foundry_ready(self):
+        # Create the OpenAI client now that the SDK has discovered the port
+        self.client = OpenAI(
+            base_url=self._fm.endpoint,
+            api_key=self._fm.api_key,
+        )
+        # Populate the model list; model loads when the user picks one
+        self._populate_model_combo()
+        self.status_label.setText("● Select a model to begin")
+        self.status_label.setStyleSheet(
+            f"color: {TEXT_MUTED}; font-size: 11px; background: transparent;"
+        )
+
+    def _on_foundry_failed(self, msg: str):
+        self.status_label.setText("● Startup failed")
+        self.status_label.setStyleSheet(
+            "color: #e53935; font-size: 11px; background: transparent;"
+        )
+        self.retry_btn.setToolTip(msg)
+        self.retry_btn.show()
+
+    def _check_connection(self):
+        self.status_label.setText("● Connecting…")
+        self.status_label.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px; background: transparent;")
+        self.retry_btn.hide()
+        self._hc_thread = QThread()
+        # Use the full model ID for the health check (that's what the endpoint expects)
+        model_id = getattr(self, '_active_model_id', self._active_model)
+        self._hc_worker = HealthCheckWorker(self.client, model_id)
+        self._hc_worker.moveToThread(self._hc_thread)
+        self._hc_thread.started.connect(self._hc_worker.run)
+        self._hc_worker.status_update.connect(self._on_foundry_status)
+        self._hc_worker.connected.connect(self._on_connected)
+        self._hc_worker.disconnected.connect(self._on_disconnected)
+        self._hc_worker.connected.connect(self._hc_thread.quit)
+        self._hc_worker.disconnected.connect(self._hc_thread.quit)
+        self._hc_worker.connected.connect(self._hc_worker.deleteLater)
+        self._hc_worker.disconnected.connect(self._hc_worker.deleteLater)
+        self._hc_thread.finished.connect(self._hc_thread.deleteLater)
+        self._hc_thread.start()
+
+    def _on_connected(self):
+        self.status_label.setText("● Ready")
+        self.status_label.setStyleSheet(f"color: #4caf50; font-size: 11px; background: transparent;")
+        self.retry_btn.hide()
+        self.send_btn.setEnabled(True)  # safe for both startup and post-switch
+
+    def _on_disconnected(self):
+        if self._active_model:
+            # A model was chosen but the endpoint never warmed up.
+            self.status_label.setText("● Model not responding — click ↻ to retry")
+            self.status_label.setStyleSheet(f"color: #e53935; font-size: 11px; background: transparent;")
+            self.retry_btn.setToolTip(
+                f"The inference endpoint for '{self._active_model}' did not respond\n"
+                "within 60 s. Click to try warming it up again."
+            )
+            # Retry should re-run the health check, NOT restart the whole service
+            try:
+                self.retry_btn.clicked.disconnect()
+            except Exception:
+                pass
+            self.retry_btn.clicked.connect(self._retry_connection)
+        else:
+            self.status_label.setText("● Foundry Local not running")
+            self.status_label.setStyleSheet(f"color: #e53935; font-size: 11px; background: transparent;")
+            self.retry_btn.setToolTip(
+                "Foundry Local service is not reachable.\n"
+                "Click here to try starting it again."
+            )
+            try:
+                self.retry_btn.clicked.disconnect()
+            except Exception:
+                pass
+            self.retry_btn.clicked.connect(self._start_foundry)
+        self.retry_btn.show()
+
+    def _retry_connection(self):
+        """Re-run just the health check without restarting the whole service."""
+        self.retry_btn.hide()
+        self._check_connection()
+
+    # ── Model switcher ────────────────────────────────────────────────────────
+    def _populate_model_combo(self):
+        """Fetch available models from the SDK and populate the combo box."""
+        self._ml_thread = QThread()
+        self._ml_worker = ModelListWorker(self._fm)
+        self._ml_worker.moveToThread(self._ml_thread)
+        self._ml_thread.started.connect(self._ml_worker.run)
+        self._ml_worker.models_ready.connect(self._on_models_ready)
+        self._ml_worker.models_ready.connect(self._ml_thread.quit)
+        self._ml_worker.models_ready.connect(self._ml_worker.deleteLater)
+        self._ml_thread.finished.connect(self._ml_thread.deleteLater)
+        self._ml_thread.start()
+
+    def _on_models_ready(self, models: list):
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        self._model_map = {}   # display_name -> alias (used for load_model)
+        self._id_map   = {}   # alias -> model_id (used for chat completions)
+        if models:
+            self.model_combo.addItem("— Select model —")
+            for alias, model_id in models:
+                display = _model_display_name(alias)
+                self._model_map[display] = alias
+                self._id_map[alias] = model_id
+                self.model_combo.addItem(display)
+            self.model_combo.setCurrentIndex(0)
+            self.model_combo.blockSignals(False)
+            self.model_combo.show()
+        else:
+            self.model_combo.blockSignals(False)
+            self.status_label.setText("● No models found — download one in AI Toolkit")
+            self.status_label.setStyleSheet(
+                "color: #e53935; font-size: 11px; background: transparent;"
+            )
+            self.retry_btn.show()
+            self.retry_btn.setToolTip(
+                "No models found in Foundry cache.\n"
+                "Download a model via AI Toolkit → Models, then click ↻."
+            )
+
+    def _on_model_combo_changed(self, display_name: str):
+        if display_name == "— Select model —":
+            return
+        new_model = self._model_map.get(display_name)
+        if new_model and new_model != self._active_model:
+            self._switch_model(new_model)
+
+    def _switch_model(self, new_model: str):
+        self.send_btn.setEnabled(False)
+        self.model_combo.setEnabled(False)
+        self._sw_thread = QThread()
+        self._sw_worker = ModelSwitchWorker(self._fm, self._active_model, new_model)
+        self._sw_worker.moveToThread(self._sw_thread)
+        self._sw_thread.started.connect(self._sw_worker.run)
+        self._sw_worker.status_update.connect(self._on_foundry_status)
+        self._sw_worker.done.connect(self._on_switch_done)
+        self._sw_worker.failed.connect(self._on_switch_failed)
+        self._sw_worker.done.connect(self._sw_thread.quit)
+        self._sw_worker.failed.connect(self._sw_thread.quit)
+        self._sw_worker.done.connect(self._sw_worker.deleteLater)
+        self._sw_worker.failed.connect(self._sw_worker.deleteLater)
+        self._sw_thread.finished.connect(self._sw_thread.deleteLater)
+        self._sw_thread.start()
+
+    def _on_switch_done(self, new_model: str):
+        self._active_model = new_model
+        # Resolve the full model ID for use in chat completions
+        self._active_model_id = self._id_map.get(new_model, new_model)
+        self._fm.model = new_model  # keep FoundryManager in sync for graceful shutdown
+        # Remove the "— Select model —" placeholder on first successful load
+        placeholder_idx = self.model_combo.findText("— Select model —")
+        if placeholder_idx >= 0:
+            self.model_combo.blockSignals(True)
+            self.model_combo.removeItem(placeholder_idx)
+            idx = self.model_combo.findText(_model_display_name(new_model))
+            if idx >= 0:
+                self.model_combo.setCurrentIndex(idx)
+            self.model_combo.blockSignals(False)
+        self.model_combo.setEnabled(True)
+        # Leave send_btn disabled — _check_connection enables it only once the
+        # inference endpoint for the new model is actually warm.
+        self._check_connection()
+
+    def _on_switch_failed(self, error: str):
+        # Revert the combo to the model that is still actually loaded
+        self.model_combo.blockSignals(True)
+        idx = self.model_combo.findText(_model_display_name(self._active_model))
+        if idx >= 0:
+            self.model_combo.setCurrentIndex(idx)
+        self.model_combo.blockSignals(False)
+        self.model_combo.setEnabled(True)
+        self.send_btn.setEnabled(True)
+        self.status_label.setText("● Switch failed")
+        self.status_label.setStyleSheet("color: #e53935; font-size: 11px; background: transparent;")
+        self.retry_btn.setToolTip(error)
+        self.retry_btn.show()
+
+    # ── UI construction ───────────────────────────────────────────────────────
+    def _setup_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(12, 12, 12, 12)  # space for shadow bleed
+        outer.setSpacing(0)
+
+        # ── Bordered container (this is what shows the orange outline) ──────────
+        self.container = QFrame()
+        self.container.setObjectName("container")
+        self.container.setStyleSheet(f"""
+            QFrame#container {{
+                background-color: {BG_MAIN};
+                border: 1px solid {ACCENT};
+                border-radius: 10px;
+            }}
+        """)
+        root = QVBoxLayout(self.container)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        outer.addWidget(self.container)
+
+        # ── Custom title bar (frameless) ────────────────────────────────────
+        self.title_bar = QFrame()
+        self.title_bar.setFixedHeight(48)
+        self.title_bar.setStyleSheet(
+            f"background-color: {BG_PANEL}; "
+            f"border-bottom: 1px solid {BORDER}; "
+            f"border-top-left-radius: 10px; "
+            f"border-top-right-radius: 10px;"
+        )
+        self.title_bar.mousePressEvent   = self._tb_mouse_press
+        self.title_bar.mouseMoveEvent    = self._tb_mouse_move
+        self.title_bar.mouseDoubleClickEvent = self._tb_double_click
+
+        h_layout = QHBoxLayout(self.title_bar)
+        h_layout.setContentsMargins(16, 0, 8, 0)
+        h_layout.setSpacing(8)
+
+        dot = QLabel("●")
+        dot.setStyleSheet(f"color: {ACCENT}; font-size: 14px; background: transparent;")
+
+        title = QLabel("Project Vera")
+        title.setStyleSheet(
+            f"color: {TEXT_PRIMARY}; font-size: 14px; font-weight: 700; background: transparent;"
+        )
+
+        self.status_label = QLabel("● Connecting…")
+        self.status_label.setStyleSheet(
+            f"color: {TEXT_MUTED}; font-size: 11px; background: transparent;"
+        )
+
+        self.retry_btn = QPushButton("↻")
+        self.retry_btn.setFixedSize(26, 26)
+        self.retry_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.retry_btn.setToolTip("Retry: start Foundry service and load model")
+        self.retry_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                border: none;
+                color: {TEXT_MUTED};
+                font-size: 16px;
+                border-radius: 6px;
+                padding: 0;
+            }}
+            QPushButton:hover {{
+                background-color: rgba(232,102,10,0.15);
+                color: {ACCENT};
+            }}
+        """)
+        self.retry_btn.clicked.connect(self._start_foundry)
+        self.retry_btn.hide()
+
+        # Model selector combo box
+        self.model_combo = QComboBox()
+        self.model_combo.setFixedHeight(28)
+        self.model_combo.setMinimumWidth(160)
+        self.model_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.model_combo.setToolTip("Switch active model")
+        self.model_combo.setStyleSheet(f"""
+            QComboBox {{
+                background-color: {BG_INPUT};
+                color: {TEXT_PRIMARY};
+                border: 1px solid {BORDER};
+                border-radius: 6px;
+                padding: 0 8px;
+                font-size: 12px;
+            }}
+            QComboBox:hover {{
+                border: 1px solid {ACCENT};
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 20px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {BG_PANEL};
+                color: {TEXT_PRIMARY};
+                border: 1px solid {BORDER};
+                selection-background-color: rgba(232,102,10,0.3);
+            }}
+        """)
+        self.model_combo.currentTextChanged.connect(self._on_model_combo_changed)
+        self.model_combo.hide()  # revealed after models are fetched
+
+        # Window control buttons — orange icon style
+        btn_style = """
+            QPushButton {{
+                background: transparent;
+                border: none;
+                color: {accent};
+                font-size: %(size)s;
+                min-width: 30px;
+                max-width: 30px;
+                min-height: 30px;
+                max-height: 30px;
+                border-radius: 6px;
+                padding: 0;
+            }}
+            QPushButton:hover {{ background-color: rgba(232,102,10,0.15); }}
+        """.format(accent=ACCENT)
+
+        min_btn = QPushButton("⎯")
+        min_btn.setStyleSheet(btn_style % {"size": "15px"})
+        min_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        min_btn.setToolTip("Minimize")
+        min_btn.clicked.connect(self.showMinimized)
+
+        max_btn = QPushButton("□")
+        max_btn.setStyleSheet(btn_style % {"size": "16px"})
+        max_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        max_btn.setToolTip("Maximise")
+        max_btn.clicked.connect(self._toggle_maximise)
+
+        close_btn = QPushButton("✕")
+        close_btn.setStyleSheet(
+            btn_style % {"size": "14px"} +
+            f"QPushButton:hover {{ background-color: #c0392b; color: #ffffff; }}"
+        )
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setToolTip("Close")
+        close_btn.clicked.connect(self.close)
+
+        h_layout.addWidget(dot)
+        h_layout.addSpacing(6)
+        h_layout.addWidget(title)
+        h_layout.addSpacing(12)
+        h_layout.addWidget(self.model_combo)
+        h_layout.addStretch()
+        h_layout.addWidget(self.status_label)
+        h_layout.addWidget(self.retry_btn)
+        h_layout.addSpacing(12)
+        h_layout.addWidget(min_btn)
+        h_layout.addWidget(max_btn)
+        h_layout.addWidget(close_btn)
+        root.addWidget(self.title_bar)
+
+        # ── Scroll area (message feed) ────────────────────────────────────────
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll_area.setStyleSheet(f"background-color: {BG_MAIN}; border: none;")
+        self.scroll_area.verticalScrollBar().setStyleSheet(f"""
+            QScrollBar:vertical {{
+                background: {BG_MAIN};
+                width: 6px;
+                border-radius: 3px;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {BORDER};
+                border-radius: 3px;
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                height: 0;
+            }}
+        """)
+
+        self.feed_widget = QWidget()
+        self.feed_widget.setStyleSheet(f"background-color: {BG_MAIN};")
+        self.feed_layout = QVBoxLayout(self.feed_widget)
+        self.feed_layout.setContentsMargins(60, 20, 60, 20)
+        self.feed_layout.setSpacing(10)
+        self.feed_layout.addStretch()
+
+        self.scroll_area.setWidget(self.feed_widget)
+        root.addWidget(self.scroll_area, stretch=1)
+
+        # ── Welcome message ───────────────────────────────────────────────────
+        welcome = QLabel("How can I help you today?")
+        welcome.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        welcome.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 20px; font-weight: 600; background: transparent; padding: 40px 0;")
+        self.feed_layout.insertWidget(0, welcome)
+        self._welcome_label = welcome
+
+        # ── Input bar ─────────────────────────────────────────────────────────
+        input_bar = QFrame()
+        input_bar.setStyleSheet(
+            f"background-color: {BG_PANEL}; "
+            f"border-top: 1px solid {BORDER}; "
+            f"border-bottom-left-radius: 10px; "
+            f"border-bottom-right-radius: 10px;"
+        )
+        i_outer = QVBoxLayout(input_bar)
+        i_outer.setContentsMargins(20, 8, 20, 12)
+        i_outer.setSpacing(6)
+
+        # ── Attachment chip (hidden until a file is staged) ─────────────────
+        self.attach_bar = QFrame()
+        self.attach_bar.setStyleSheet("background: transparent;")
+        attach_row = QHBoxLayout(self.attach_bar)
+        attach_row.setContentsMargins(0, 0, 0, 0)
+        attach_row.setSpacing(6)
+
+        self.attach_chip = QLabel()
+        self.attach_chip.setStyleSheet(f"""
+            QLabel {{
+                background-color: {BG_INPUT};
+                color: {ACCENT};
+                border: 1px solid {ACCENT};
+                border-radius: 6px;
+                padding: 2px 10px;
+                font-size: 12px;
+            }}
+        """)
+
+        self.attach_clear_btn = QPushButton("✕")
+        self.attach_clear_btn.setFixedSize(22, 22)
+        self.attach_clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.attach_clear_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                border: none;
+                color: {TEXT_MUTED};
+                font-size: 12px;
+            }}
+            QPushButton:hover {{ color: #e53935; }}
+        """)
+        self.attach_clear_btn.setToolTip("Remove attachment")
+        self.attach_clear_btn.clicked.connect(self._clear_attachment)
+
+        attach_row.addWidget(self.attach_chip)
+        attach_row.addWidget(self.attach_clear_btn)
+        attach_row.addStretch()
+        self.attach_bar.hide()
+        i_outer.addWidget(self.attach_bar)
+
+        # ── Text input + send button ────────────────────────────────────────
+        i_layout = QHBoxLayout()
+        i_layout.setContentsMargins(0, 0, 0, 0)
+        i_layout.setSpacing(10)
+        i_outer.addLayout(i_layout)
+
+        self.input_field = QLineEdit()
+        self.input_field.setPlaceholderText("How can I help you today?")
+        self.input_field.setFixedHeight(42)
+        self.input_field.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: {BG_INPUT};
+                color: {TEXT_PRIMARY};
+                border: 1px solid {BORDER};
+                border-radius: 8px;
+                padding: 0 14px;
+                font-size: 14px;
+            }}
+            QLineEdit:focus {{
+                border: 1px solid {ACCENT};
+            }}
+        """)
+        self.input_field.returnPressed.connect(self._send_message)
+
+        self.send_btn = QPushButton("Send")
+        self.send_btn.setFixedSize(80, 42)
+        self.send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.send_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {ACCENT};
+                color: #ffffff;
+                border: none;
+                border-radius: 8px;
+                font-size: 14px;
+                font-weight: 600;
+            }}
+            QPushButton:hover {{
+                background-color: {ACCENT_HOVER};
+            }}
+            QPushButton:disabled {{
+                background-color: {BORDER};
+                color: {TEXT_MUTED};
+            }}
+        """)
+        self.send_btn.clicked.connect(self._send_message)
+        self.send_btn.setEnabled(False)  # enabled once a model is loaded and warm
+
+        i_layout.addWidget(self.input_field)
+        i_layout.addWidget(self.send_btn)
+        root.addWidget(input_bar)
+
+
+        self._setup_drop_overlay()
+
+    # ── Drop-zone overlay ─────────────────────────────────────────────────────
+    def _setup_drop_overlay(self):
+        """Translucent overlay shown when a supported file is dragged over the window."""
+        self._drop_overlay = QLabel(self)
+        self._drop_overlay.setText("⬇   Drop file here")
+        self._drop_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._drop_overlay.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self._drop_overlay.setStyleSheet(f"""
+            QLabel {{
+                background-color: rgba(26, 26, 26, 0.90);
+                color: {ACCENT};
+                font-size: 28px;
+                font-weight: 700;
+                border: 2px dashed {ACCENT};
+                border-radius: 10px;
+            }}
+        """)
+        self._drop_overlay.hide()
+        self._position_overlay()
+
+    def _position_overlay(self):
+        if hasattr(self, '_drop_overlay'):
+            m = 12  # matches the outer shadow-bleed margin
+            self._drop_overlay.setGeometry(m, m, self.width() - 2 * m, self.height() - 2 * m)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_overlay()
+
+    # ── Drag & Drop ───────────────────────────────────────────────────────────
+    _SUPPORTED_EXTS = {
+        '.txt', '.csv', '.md', '.py', '.json', '.log',
+        '.html', '.xml', '.yaml', '.yml', '.toml',
+        '.ini', '.cfg', '.pdf',
+    }
+
+    def dragEnterEvent(self, event):
+        md = event.mimeData()
+        if md.hasUrls() and any(
+            Path(u.toLocalFile()).suffix.lower() in self._SUPPORTED_EXTS
+            for u in md.urls()
+        ):
+            event.acceptProposedAction()
+            self._set_drop_highlight(True)
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._set_drop_highlight(False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        self._set_drop_highlight(False)
+        for url in event.mimeData().urls():
+            local = url.toLocalFile()
+            if local and Path(local).suffix.lower() in self._SUPPORTED_EXTS:
+                self._send_file_message(local)
+                break  # one file at a time
+        event.acceptProposedAction()
+
+    def _set_drop_highlight(self, active: bool):
+        if hasattr(self, '_drop_overlay'):
+            if active:
+                self._drop_overlay.show()
+                self._drop_overlay.raise_()
+            else:
+                self._drop_overlay.hide()
+
+    # ── File content reader ───────────────────────────────────────────────────
+    @staticmethod
+    def _read_file_content(path: str) -> str:
+        ext = Path(path).suffix.lower()
+        if ext == '.pdf':
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(path)
+                pages = [page.extract_text() or "" for page in reader.pages]
+                return "\n\n".join(pages).strip()
+            except ImportError:
+                return "[PDF support not installed. Run: pip install pypdf]"
+            except Exception as e:
+                return f"[Could not read PDF: {e}]"
+        else:
+            try:
+                with open(path, encoding='utf-8', errors='replace') as f:
+                    return f.read()
+            except Exception as e:
+                return f"[Could not read file: {e}]"
+
+    def _send_file_message(self, path: str):
+        """Stage a dropped file as a pending attachment — does NOT send yet."""
+        if not self.send_btn.isEnabled():
+            return  # don't interrupt active streaming
+
+        name = Path(path).name
+        raw = self._read_file_content(path)
+
+        MAX_CHARS = 12_000
+        truncated = len(raw) > MAX_CHARS
+        content = raw[:MAX_CHARS] if truncated else raw
+
+        display = f"📎 {name}" + (f"  · first {MAX_CHARS:,} chars" if truncated else "")
+        self._pending_attachment = {"name": name, "content": content, "truncated": truncated}
+
+        self.attach_chip.setText(display)
+        self.attach_bar.show()
+        self.input_field.setFocus()
+        self.input_field.setPlaceholderText("Add a message for the attached file, then Send…")
+
+    def _clear_attachment(self):
+        self._pending_attachment = None
+        self.attach_bar.hide()
+        self.input_field.setPlaceholderText("How can I help you today?")
+
+    # ── Frameless window drag & controls ─────────────────────────────────────
+    def _tb_mouse_press(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def _tb_mouse_move(self, event):
+        if event.buttons() == Qt.MouseButton.LeftButton and not self._drag_pos.isNull():
+            self.move(event.globalPosition().toPoint() - self._drag_pos)
+
+    def _tb_double_click(self, event):
+        self._toggle_maximise()
+
+    def _toggle_maximise(self):
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if sys.platform == "win32":
+            # Delay until the Win32 taskbar button has been created
+            QTimer.singleShot(150, self._apply_win32_taskbar_icon)
+
+    def _apply_win32_taskbar_icon(self):
+        """Force the correct icon onto the Win32 taskbar button.
+        Frameless + translucent windows need this done after the event loop
+        has processed the show event, otherwise the taskbar button doesn't
+        exist yet and the call is a no-op."""
+        try:
+            icon_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "Logo", "icon.ico"
+            )
+            if not os.path.exists(icon_path):
+                return
+
+            hwnd = int(self.winId())
+
+            # 1. Ensure WS_EX_APPWINDOW is set (groups window under our icon,
+            #    not python.exe) and WS_EX_TOOLWINDOW is clear.
+            GWL_EXSTYLE      = -20
+            WS_EX_APPWINDOW  = 0x00040000
+            WS_EX_TOOLWINDOW = 0x00000080
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            style = (style | WS_EX_APPWINDOW) & ~WS_EX_TOOLWINDOW
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+
+            # 2. Notify Windows the frame has changed so it re-reads the style.
+            SWP_NOMOVE = 0x0002; SWP_NOSIZE = 0x0001
+            SWP_NOZORDER = 0x0004; SWP_FRAMECHANGED = 0x0020
+            ctypes.windll.user32.SetWindowPos(
+                hwnd, 0, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED
+            )
+
+            # 3. Load the ICO and send WM_SETICON for both big and small sizes.
+            hicon = ctypes.windll.user32.LoadImageW(
+                None, icon_path, 1,   # IMAGE_ICON
+                0, 0, 0x0010 | 0x0040  # LR_LOADFROMFILE | LR_DEFAULTSIZE
+            )
+            if hicon:
+                ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 1, hicon)  # ICON_BIG
+                ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 0, hicon)  # ICON_SMALL
+        except Exception:
+            pass
+
+    def _apply_theme(self):
+        self.setStyleSheet("QMainWindow { background: transparent; }")
+        palette = self.palette()
+        palette.setColor(QPalette.ColorRole.Window, QColor("transparent"))
+        self.setPalette(palette)
+        QApplication.setFont(QFont("Segoe UI", 10))
+
+        # Soft orange glow shadow on the bordered container
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(30)
+        shadow.setOffset(0, 0)
+        shadow.setColor(QColor(ACCENT))
+        self.container.setGraphicsEffect(shadow)
+
+    # ── Messaging logic ───────────────────────────────────────────────────────
+    def _add_bubble(self, role: str, text: str = "") -> MessageBubble:
+        """Insert a message bubble into the feed and return it."""
+        # Remove welcome label on first message
+        if self._welcome_label is not None:
+            self._welcome_label.hide()
+            self._welcome_label = None
+
+        bubble = MessageBubble(role)
+        if text:
+            bubble.set_text(text)
+
+        # Insert before the trailing stretch
+        count = self.feed_layout.count()
+        self.feed_layout.insertWidget(count - 1, bubble)
+        self._scroll_to_bottom()
+        return bubble
+
+    def _scroll_to_bottom(self):
+        QApplication.processEvents()
+        sb = self.scroll_area.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _send_message(self):
+        text = self.input_field.text().strip()
+        # Allow sending with only an attachment and no typed text
+        if not text and self._pending_attachment is None:
+            return
+        if not self.send_btn.isEnabled():
+            return
+
+        self.input_field.clear()
+        self.send_btn.setEnabled(False)
+        self.status_label.setText("● Thinking…")
+        self.status_label.setStyleSheet(f"color: {ACCENT}; font-size: 11px; background: transparent;")
+
+        # Build display text and model message, folding in any pending attachment
+        att = self._pending_attachment
+        if att:
+            self._clear_attachment()
+            name, content, truncated = att["name"], att["content"], att["truncated"]
+            chip = f"📎 {name}" + (f"  · first 12,000 chars" if truncated else "")
+            display = f"{chip}\n{text}" if text else chip
+            model_content = f"[Attached file: {name}]\n\n{content}"
+            if truncated:
+                model_content += f"\n\n[Note: file truncated to 12,000 characters]"
+            if text:
+                model_content += f"\n\n{text}"
+        else:
+            display = text
+            model_content = text
+
+        # Show user bubble
+        self._add_bubble("user", display)
+
+        # Add to history
+        self.history.append({"role": "user", "content": model_content})
+
+        # Create empty assistant bubble — tokens stream into it
+        self._current_bubble = self._add_bubble("assistant")
+
+        # Start streaming thread
+        self._thread = QThread()
+        model_id = getattr(self, '_active_model_id', self._active_model)
+        self._worker = StreamWorker(self.client, list(self.history), model_id)
+        self._worker.moveToThread(self._thread)
+
+        self._thread.started.connect(self._worker.run)
+        self._worker.token_received.connect(self._on_token)
+        self._worker.error_occurred.connect(self._on_error)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
+
+        self._thread.start()
+
+    def _on_token(self, token: str):
+        if self._current_bubble:
+            self._current_bubble.append_text(token)
+            self._scroll_to_bottom()
+
+    def _on_error(self, error: str):
+        if self._current_bubble:
+            endpoint = self._fm.endpoint if hasattr(self, '_fm') else 'unknown'
+            self._current_bubble.set_text(
+                f"⚠ Could not reach Foundry Local.\n\n"
+                f"Endpoint: {endpoint}\n\nError: {error}"
+            )
+
+    def _on_finished(self):
+        # Save assistant reply to history
+        if self._current_bubble:
+            reply = self._current_bubble.text_edit.toPlainText()
+            if reply:
+                self.history.append({"role": "assistant", "content": reply})
+
+        self.send_btn.setEnabled(True)
+        self.input_field.setFocus()
+        self.status_label.setText("● Ready")
+        self.status_label.setStyleSheet(f"color: #4caf50; font-size: 11px; background: transparent;")
+        self._current_bubble = None
+
+    def closeEvent(self, event):
+        """Stop the Foundry service cleanly when the window is closed."""
+        self.status_label.setText("● Shutting down…")
+        QApplication.processEvents()
+        if hasattr(self, '_fm'):
+            # Run stop in a thread so the UI doesn't freeze
+            t = threading.Thread(target=self._fm.stop_foundry, daemon=True)
+            t.start()
+            t.join(timeout=20)  # wait up to 20 s then force-quit
+        event.accept()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setApplicationName("Project Vera")
+    app.setStyle("Fusion")
+
+    # Set taskbar + window icon
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Logo", "icon.ico")
+    if os.path.exists(icon_path):
+        icon = QIcon(icon_path)
+        app.setWindowIcon(icon)
+
+    window = ChatWindow()
+    if os.path.exists(icon_path):
+        window.setWindowIcon(QIcon(icon_path))
+    window.show()
+
+    sys.exit(app.exec())
