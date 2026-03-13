@@ -27,7 +27,7 @@ if sys.platform == "win32":
         pass
 
 from PySide6.QtCore import Qt, Signal, QObject, QThread, QPoint, QTimer, QPropertyAnimation, QEasingCurve, QSize
-from PySide6.QtGui import QFont, QColor, QPalette, QTextCursor, QIcon
+from PySide6.QtGui import QFont, QColor, QPalette, QTextCursor, QIcon, QPainter
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QTextEdit, QLineEdit, QPushButton,
@@ -470,24 +470,58 @@ class StreamWorker(QObject):
         self.client     = client
         self.messages   = messages
         self.model_name = model_name
+        self._stop      = False
+
+    def stop(self):
+        """Request the streaming loop to exit on the next chunk."""
+        self._stop = True
+
+    _TRANSIENT_KEYWORDS = [
+        "incomplete chunked read", "peer closed", "connection reset",
+        "connection was closed", "incomplete message", "remotedisconnected",
+    ]
+
+    def _is_transient(self, err: str) -> bool:
+        low = err.lower()
+        return any(k in low for k in self._TRANSIENT_KEYWORDS)
 
     def run(self):
-        try:
-            stream = self.client.chat.completions.create(
-                model=self.model_name,
-                messages=self.messages,
-                stream=True,
-                temperature=0.7,
-                max_tokens=2048,
-            )
-            for chunk in stream:
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    self.token_received.emit(delta)
-        except Exception as e:
-            self.error_occurred.emit(str(e))
-        finally:
-            self.finished.emit()
+        MAX_RETRIES = 1
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                stream = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=self.messages,
+                    stream=True,
+                    temperature=0.7,
+                    max_tokens=2048,
+                    timeout=120.0,   # per-chunk read timeout (seconds)
+                )
+                for chunk in stream:
+                    if self._stop:
+                        break
+                    delta = chunk.choices[0].delta.content
+                    if delta:
+                        self.token_received.emit(delta)
+                break   # success — exit retry loop
+            except Exception as e:
+                if self._stop:
+                    break
+                err = str(e)
+                if self._is_transient(err) and attempt < MAX_RETRIES:
+                    time.sleep(2)   # brief pause then retry
+                    continue
+                # Final failure — surface it
+                if "timeout" in err.lower() or "timed out" in err.lower():
+                    err = ("Model stopped responding (timeout).\n"
+                           "The file may be too large. Try a smaller excerpt.")
+                elif self._is_transient(err):
+                    err = ("Foundry Local dropped the connection.\n"
+                           "The model may have run out of memory.\n"
+                           "Try with a smaller file or shorter prompt.")
+                self.error_occurred.emit(err)
+                break
+        self.finished.emit()
 
 
 # ── Startup health-check worker ──────────────────────────────────────────────
@@ -522,6 +556,120 @@ class HealthCheckWorker(QObject):
                 if attempt < 14:
                     time.sleep(1)
         self.disconnected.emit()
+
+
+# ── Bit-dog walking animation ────────────────────────────────────────────────
+class BitDogWidget(QWidget):
+    """
+    Pixel-art dog that walks left and right inside the assistant bubble
+    while the model is thinking.  Disappears on the first streamed token.
+    """
+    SCALE     = 3    # screen-pixels per sprite-grid cell
+    W_CELLS   = 13   # sprite width  in grid cells
+    H_CELLS   = 10   # sprite height in grid cells
+    MOVE_STEP = 2    # px moved per movement tick
+    MOVE_MS   = 30   # movement timer interval (ms)
+    FRAME_MS  = 160  # walk-cycle timer interval (ms)
+
+    # Right-facing walk frames.  Cell values:
+    #   0 = transparent   1 = body (orange)   2 = dark (tail tip)   3 = eye (light)
+    # Head faces RIGHT; tail is on the LEFT side of the grid.
+    _FR = [
+        # Frame A — legs together
+        [
+            [0,0,0,0,0,0,0,0,0,1,1,0,0],
+            [0,0,0,0,0,0,0,0,1,1,1,0,0],
+            [0,0,0,0,1,1,1,1,1,3,1,1,0],
+            [0,0,0,0,1,1,1,1,1,1,1,1,0],
+            [2,2,1,1,1,1,1,1,1,1,1,0,0],
+            [0,0,1,1,1,1,1,1,1,1,0,0,0],
+            [0,0,1,1,0,0,0,1,1,0,0,0,0],
+            [0,0,1,1,0,0,0,1,1,0,0,0,0],
+            [0,0,0,1,0,0,0,1,0,0,0,0,0],
+            [0,0,0,0,0,0,0,0,0,0,0,0,0],
+        ],
+        # Frame B — legs spread
+        [
+            [0,0,0,0,0,0,0,0,0,1,1,0,0],
+            [0,0,0,0,0,0,0,0,1,1,1,0,0],
+            [0,0,0,0,1,1,1,1,1,3,1,1,0],
+            [0,0,0,0,1,1,1,1,1,1,1,1,0],
+            [2,2,1,1,1,1,1,1,1,1,1,0,0],
+            [0,0,1,1,1,1,1,1,1,1,0,0,0],
+            [0,1,1,0,0,0,0,0,1,1,0,0,0],
+            [1,1,0,0,0,0,0,0,0,1,1,0,0],
+            [1,0,0,0,0,0,0,0,0,0,1,0,0],
+            [0,0,0,0,0,0,0,0,0,0,0,0,0],
+        ],
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(self.H_CELLS * self.SCALE + 10)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setStyleSheet("background: transparent;")
+
+        # Build mirrored left-facing frames
+        self._frames = {
+            'R': self._FR,
+            'L': [[list(reversed(row)) for row in f] for f in self._FR],
+        }
+
+        self._x     = 0
+        self._dir   = 1      # +1 right, -1 left
+        self._face  = 'R'
+        self._frame = 0
+
+        self._col_body = QColor(ACCENT)
+        self._col_dark = QColor(ACCENT).darker(180)
+        self._col_eye  = QColor("#d8d8d8")
+
+        self._move_timer  = QTimer(self)
+        self._frame_timer = QTimer(self)
+        self._move_timer.timeout.connect(self._tick_move)
+        self._frame_timer.timeout.connect(self._tick_frame)
+
+    def start(self):
+        self._x, self._dir, self._face, self._frame = 0, 1, 'R', 0
+        self.show()
+        self._move_timer.start(self.MOVE_MS)
+        self._frame_timer.start(self.FRAME_MS)
+
+    def stop(self):
+        self._move_timer.stop()
+        self._frame_timer.stop()
+        self.hide()
+
+    def _tick_move(self):
+        sprite_w = self.W_CELLS * self.SCALE
+        max_x = max(0, self.width() - sprite_w - 4)
+        self._x = max(0, min(self._x + self.MOVE_STEP * self._dir, max_x))
+        if self._x >= max_x:
+            self._dir, self._face = -1, 'L'
+        elif self._x <= 0:
+            self._dir, self._face = 1, 'R'
+        self.update()
+
+    def _tick_frame(self):
+        self._frame = (self._frame + 1) % 2
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        grid  = self._frames[self._face][self._frame]
+        s     = self.SCALE
+        y_off = (self.height() - self.H_CELLS * s) // 2
+        for r, row in enumerate(grid):
+            for c, cell in enumerate(row):
+                if cell == 0:
+                    continue
+                color = (self._col_body if cell == 1
+                         else self._col_dark if cell == 2
+                         else self._col_eye)
+                painter.fillRect(self._x + c * s, y_off + r * s, s, s, color)
+        painter.end()
 
 
 # ── Message bubble widget ─────────────────────────────────────────────────────
@@ -560,6 +708,14 @@ class MessageBubble(QFrame):
         """)
         layout.addWidget(role_label)
 
+        # Walking dog — assistant bubbles only, hidden until show_thinking()
+        self._thinking = False
+        self._dog: BitDogWidget | None = None
+        if not is_user:
+            self._dog = BitDogWidget(self)
+            self._dog.hide()
+            layout.addWidget(self._dog)
+
         # Message text
         self.text_edit = QTextEdit()
         self.text_edit.setReadOnly(True)
@@ -584,8 +740,10 @@ class MessageBubble(QFrame):
 
     def _adjust_height(self):
         doc = self.text_edit.document()
-        # Force reflow at the current visible width so height is accurate
+        # viewport().width() is 0 right after show() — fall back to widget width
         width = self.text_edit.viewport().width()
+        if width <= 0:
+            width = self.text_edit.width()
         if width > 0:
             doc.setTextWidth(width)
         doc_height = int(doc.size().height())
@@ -601,6 +759,25 @@ class MessageBubble(QFrame):
 
     def set_text(self, text: str):
         self.text_edit.setPlainText(text)
+        self._adjust_height()
+
+    def show_thinking(self):
+        """Show the walking dog above the (empty) text area."""
+        if self._dog is None:
+            return
+        self._thinking = True
+        self.text_edit.setFixedHeight(0)   # collapse so bubble fits dog only
+        self._dog.start()
+        self.updateGeometry()
+
+    def stop_thinking(self):
+        """Hide the dog.  Safe to call multiple times."""
+        if not self._thinking:
+            return
+        self._thinking = False
+        if self._dog:
+            self._dog.stop()
+        self.text_edit.setFixedHeight(24)   # restore minimum before text flows in
         self._adjust_height()
 
 
@@ -1714,7 +1891,22 @@ class ChatWindow(QMainWindow):
             return
 
         self.input_field.clear()
-        self.send_btn.setEnabled(False)
+        # Transform Send → Stop while streaming
+        self.send_btn.setText("■ Stop")
+        self.send_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #c0392b; color: #ffffff;
+                border: none; border-radius: 8px;
+                font-size: 14px; font-weight: 600;
+            }
+            QPushButton:hover { background-color: #e53935; }
+        """)
+        self.send_btn.setEnabled(True)
+        try:
+            self.send_btn.clicked.disconnect()
+        except Exception:
+            pass
+        self.send_btn.clicked.connect(self._stop_streaming)
         self.status_label.setText("● Thinking…")
         self.status_label.setStyleSheet(f"color: {ACCENT}; font-size: 11px; background: transparent;")
 
@@ -1760,6 +1952,8 @@ class ChatWindow(QMainWindow):
 
         # Create empty assistant bubble — tokens stream into it
         self._current_bubble = self._add_bubble("assistant")
+        self._current_bubble.show_thinking()
+        QApplication.processEvents()  # settle layout so text_edit has a valid width
 
         # Start streaming thread
         self._thread = QThread()
@@ -1779,11 +1973,30 @@ class ChatWindow(QMainWindow):
 
     def _on_token(self, token: str):
         if self._current_bubble:
+            self._current_bubble.stop_thinking()  # no-op after first call
             self._current_bubble.append_text(token)
             self._scroll_to_bottom()
 
+    def _stop_streaming(self):
+        """Signal the worker to stop; _on_finished will restore the UI once the
+        thread has actually wound down, preventing QThread destruction crashes."""
+        if self._worker is not None:
+            self._worker.stop()
+        # Stop the dog immediately
+        if self._current_bubble:
+            self._current_bubble.stop_thinking()
+        # Disable button until _on_finished fires — prevents sending while thread
+        # is still alive (which would replace self._thread and crash Qt)
+        self.send_btn.setText("Stopping…")
+        self.send_btn.setEnabled(False)
+        self.status_label.setText("● Stopping…")
+        self.status_label.setStyleSheet(
+            f"color: {TEXT_MUTED}; font-size: 11px; background: transparent;"
+        )
+
     def _on_error(self, error: str):
         if self._current_bubble:
+            self._current_bubble.stop_thinking()
             endpoint = self._fm.endpoint if hasattr(self, '_fm') else 'unknown'
             self._current_bubble.set_text(
                 f"⚠ Could not reach Foundry Local.\n\n"
@@ -1793,6 +2006,7 @@ class ChatWindow(QMainWindow):
     def _on_finished(self):
         # Save assistant reply to history
         if self._current_bubble:
+            self._current_bubble.stop_thinking()  # safety net if no tokens arrived
             reply = self._current_bubble.text_edit.toPlainText()
             if reply:
                 self.history.append({"role": "assistant", "content": reply})
@@ -1802,7 +2016,23 @@ class ChatWindow(QMainWindow):
                     self._current_session.updated_at = datetime.utcnow().isoformat()
                     self._update_session_in_list(self._current_session)
 
+        # Restore Stop → Send button
+        self.send_btn.setText("Send")
+        self.send_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {ACCENT}; color: #ffffff;
+                border: none; border-radius: 8px;
+                font-size: 14px; font-weight: 600;
+            }}
+            QPushButton:hover {{ background-color: {ACCENT_HOVER}; }}
+            QPushButton:disabled {{ background-color: {BORDER}; color: {TEXT_MUTED}; }}
+        """)
         self.send_btn.setEnabled(True)
+        try:
+            self.send_btn.clicked.disconnect()
+        except Exception:
+            pass
+        self.send_btn.clicked.connect(self._send_message)
         self.input_field.setFocus()
         self.status_label.setText("● Ready")
         self.status_label.setStyleSheet(f"color: #4caf50; font-size: 11px; background: transparent;")
