@@ -1,265 +1,206 @@
-# Project Vera — Local AI Desktop Chatbot
+# Project Vera  Local AI Desktop Chatbot
 
-A **bulletproof** local-first AI chat application powered by Microsoft Foundry Local. Chat with AI models running entirely on your machine—no cloud, no subscriptions, no data sent anywhere.
+A polished, local-first AI chat application powered by Microsoft Foundry Local. Chat with AI models running entirely on your machine  no cloud, no subscriptions, no data sent anywhere.
 
 **License:** Apache 2.0 (free, open-source)
 
 ---
 
-## ✨ Features
+##  Features
 
-- 🖥️ **100% Local** — All models and inference run on your PC via Foundry Local
-- 🤖 **Multi-Model Support** — Swap between any Foundry-cached model (Phi, Qwen, etc.) with one click
-- 💬 **Streaming Responses** — Real-time token streaming for smooth, interactive chat
-- 📎 **File Attachments** — Drag-and-drop support for text, code, PDFs, and more
-- 🎨 **Polished UI** — Frameless window, custom title bar, orange accent (OpenClaw-inspired)
-- 🔧 **Auto-Management** — Service and model auto-start/stop with graceful cleanup
-- ⚡ **Fast Model Loading** — Uses official `foundry-local-sdk` for synchronous, reliable loading
+-  **100% Local**  All models and inference run on your PC via Foundry Local
+-  **Multi-Model Support**  Swap between any Foundry-cached model with one click
+-  **Streaming Responses**  Real-time token streaming with a Stop button
+-  **Stream Retry**  Automatically recovers from transient stream errors
+-  **File Attachments**  Drag-and-drop support for text, code, PDFs, and more
+-  **Persistent Chat History**  All sessions saved in SQLite; browse from the sidebar
+-  **Polished UI**  Frameless window, custom title bar with pixel-art BitDog mascot, orange accent
+-  **Windows 11 Snap Layout**  Hover the maximise button to see the snap grid; drag the title bar to snap zones
+-  **Corner Resize**  Drag any corner to resize (Win32 SC_SIZE, no native chrome)
+-  **Auto-Management**  Service and model auto-start/stop with graceful cleanup
+-  **Fast Model Loading**  Uses official `foundry-local-sdk` for synchronous, reliable loading
 
 ---
 
-## 🚀 Getting Started
+##  Getting Started
 
 ### Prerequisites
 
-1. **Windows 10/11**
-2. **Foundry Local** installed via Microsoft Store or WinGet:
+1. **Windows 10/11** (Win32 APIs used for window chrome)
+2. **Foundry Local** installed:
    ```powershell
    winget install Microsoft.FoundryLocal
    ```
-3. **Python 3.10+** (included in venv)
-4. **At least one cached model** (download via AI Toolkit)
+3. **Python 3.10+**
+4. **At least one cached model** (download via AI Toolkit  Models)
 
 ### Installation
 
-1. Clone or download this repository
-2. Create and activate a Python virtual environment:
-   ```powershell
-   python -m venv venv
-   .\venv\Scripts\activate
-   ```
-3. Install dependencies:
-   ```powershell
-   pip install -r requirements.txt
-   ```
+```powershell
+git clone <repo-url>
+cd "Basic Local Agent"
+python -m venv venv
+.\venv\Scripts\activate
+pip install -r requirements.txt
+```
 
-### Running
+### Running from source
 
-**From source:**
 ```powershell
 python app.py
 ```
 
-**Or use the pre-built EXE** (if available):
+### Pre-built executable
+
 ```powershell
 .\dist\ProjectVera.exe
 ```
 
 ---
 
-## 🔧 Architecture
-
-### The Problem We Solved
-
-The original implementation tried to:
-- Call `foundry.exe` via `subprocess` (fragile, especially for App Execution Aliases)
-- Hardcode the port as `5272` (Foundry uses a **dynamic port** like 49671)
-- Parse CLI output with regex (error-prone, brittle)
-
-**Result:** Models never loaded, health checks timed out, app crashed.
-
-### The Solution: Official Microsoft SDK
-
-We replaced all subprocess calls with the **official `foundry-local-sdk`** Python package, which provides:
-
-| Feature | Old (Broken) | New (SDK) |
-|---------|--------------|-----------|
-| **Port Discovery** | Hardcoded `5272` ❌ | `FoundryLocalManager.endpoint` ✅ |
-| **Service Start** | `subprocess.run(["foundry", "service", "start"])` ❌ | `FoundryLocalManager(bootstrap=True)` ✅ |
-| **Model Loading** | `subprocess.run(["foundry", "model", "load", ...])` ❌ | `sdk.load_model(alias)` (synchronous, blocks until ready) ✅ |
-| **Cache Listing** | Regex parsing CLI output ❌ | `sdk.list_cached_models()` (proper objects) ✅ |
-| **Reliability** | App Execution Alias issues ❌ | Native Python, handles all edge cases ✅ |
+##  Architecture
 
 ### Code Structure
 
 ```
-app.py (1,200 lines, single-file app)
-├── FoundryManager (QObject)
-│   ├── start_foundry()          — Initialize SDK, discover port
-│   ├── load_model(alias)        — Load via SDK (blocks until ready)
-│   ├── unload_model()           — Unload via SDK
-│   └── list_cached()            — Get cached models
-│
-├── ModelListWorker (QObject)    — Fetch models in background thread
-├── ModelSwitchWorker (QObject)  — Unload old model, load new one
-├── StreamWorker (QObject)       — Stream chat completions tokens
-├── HealthCheckWorker (QObject)  — Poll endpoint until warm (15 retries, 1s each)
-│
-├── ChatWindow (QMainWindow)     — Main UI
-│   ├── Frameless, custom title bar
-│   ├── Message feed with bubbles
-│   ├── Drag-and-drop file support
-│   └── Model selector combo box
-│
-└── MessageBubble (QFrame)       — Individual chat message
+app.py (~2,300 lines, single-file application)
+ FoundryManager (QObject)
+    start_foundry()           Init SDK, discover dynamic port
+    load_model(alias)         Synchronous load via SDK
+    unload_model()            Unload via SDK
+    list_cached()             List cached models
+
+ ModelListWorker               Fetch model list in background thread
+ ModelSwitchWorker             Unload old / load new model
+ StreamWorker                  Stream chat completions with retry
+ HealthCheckWorker             Poll endpoint until warm
+
+ BitDogWidget (QWidget)        Pixel-art dog mascot
+    start()                   Walking animation
+    sit(flip_ms)              Front-facing ear-flap animation
+    stop()                    Idle
+
+ ChatWindow (QMainWindow)
+    Frameless window with WS_THICKFRAME + WS_CAPTION
+    nativeEvent  WM_NCCALCSIZE strips chrome; WM_NCHITTEST drives Snap Layout
+    eventFilter  corner-zone detection  Win32 SC_SIZE resize
+    Custom title bar (burger menu, BitDog, title, model selector, window controls)
+    Chat history sidebar (SQLite, 6-month auto-cleanup)
+    Message feed with streaming bubbles
+    Drag-and-drop file support
+
+ MessageBubble (QFrame)        Individual chat message with Markdown rendering
 ```
 
 ### Key Design Decisions
 
-1. **Dynamic Port Discovery** — `FoundryLocalManager.endpoint` is set once after SDK init; passed to OpenAI client immediately
-2. **Synchronous Model Load** — `sdk.load_model()` blocks until the model is truly ready; no guessing
-3. **Short Health Check** — Only 15 retries (15s) because the SDK guarantees the model is ready
-4. **Dual Model References** — Store both alias (for load/unload) and full ID (for chat completions)
-5. **Clean Shutdown** — Unload model on app close (service keeps running for other apps)
+| Concern | Approach |
+|---------|----------|
+| Port discovery | `FoundryLocalManager.endpoint` (dynamic port, not hardcoded 5272) |
+| Model loading | `sdk.load_model()`  synchronous, blocks until ready |
+| Snap Layout | `WS_CAPTION` + `WM_NCHITTEST  HTMAXBUTTON / HTCAPTION` |
+| Corner resize | `WM_SYSCOMMAND SC_SIZE` via Win32  smooth, no flicker |
+| Chat persistence | SQLite via `sqlite3` stdlib  zero extra dependency |
+| Stream reliability | Exponential-back-off retry on `APIConnectionError` / `APIStatusError` |
 
 ---
 
-## 📋 Requirements
-
-See `requirements.txt`:
+##  Requirements
 
 ```
-PySide6==6.7.2          # Qt UI framework
-openai==1.42.0          # OpenAI-compatible client
-foundry-local-sdk==0.5.1 # Official Foundry SDK (THE KEY FIX)
-pypdf==6.8.0            # PDF support
+PySide6>=6.7          # Qt UI framework
+openai>=1.42          # OpenAI-compatible client
+foundry-local-sdk     # Official Foundry SDK
+pypdf                 # PDF attachment support
 ```
 
 ---
 
-## 🎯 Usage
+##  Usage
 
-1. **Start the app** → Foundry Local service auto-starts
-2. **Wait for "Select a model to begin"** → Model list populated from cache
-3. **Choose a model** → Model loads via `sdk.load_model()` (synchronous)
-4. **Wait for "Ready"** → Health check confirms endpoint is warm
-5. **Chat!** → Type or drag-and-drop files
-6. **Close app** → Model unloads, service remains running
+1. **Launch**  Foundry Local service auto-starts
+2. **Select a model** from the title-bar drop-down  loads synchronously
+3. **Wait for "Ready"** in the status bar
+4. **Chat**  type or drag-and-drop files
+5. **Browse history**  click the  burger menu to open the sidebar
+6. **Snap**  hover the  button for Win11 Snap Layout, or drag the title bar to an edge
+7. **Close**  model unloads cleanly; service keeps running for other apps
 
 ### Drag-and-Drop Supported Formats
 
-- Text: `.txt`, `.md`, `.log`, `.csv`, `.json`
-- Code: `.py`, `.js`, `.html`, `.xml`, `.yaml`, `.toml`, `.ini`, `.cfg`
-- Documents: `.pdf` (requires pypdf)
+- Text / code: `.txt`, `.md`, `.log`, `.csv`, `.json`, `.py`, `.js`, `.html`, `.xml`, `.yaml`, `.toml`, `.ini`, `.cfg`
+- Documents: `.pdf`
 
 ---
 
-## 🐛 Troubleshooting
+##  Troubleshooting
 
-### **App says "Startup failed"**
-
-**Check the error message (hover over ↻)**
-
-- **"foundry-local-sdk not installed"** → Run: `pip install foundry-local-sdk`
-- **"Foundry Local is not installed"** → Run: `winget install Microsoft.FoundryLocal`
-
-### **App shows "No models found"**
-
-- Download a model via **AI Toolkit** → Models → Download
-- Click ↻ to refresh the list
-- Common models: Phi-3-mini, Qwen2.5-7b, Phi-3.5-mini
-
-### **"Model not responding" after loading**
-
-- **Rare issue** — click ↻ to re-run the health check (15s max)
-- If it persists, close and reopen the app (will unload the broken model)
-
-### **Slow model loading**
-
-- First load of a large model (6–7GB) can take 2–3 minutes
-- Subsequent loads are much faster
-- Watch the title bar status for progress
-
-### **App crashes on close**
-
-- Normal if you close during model switching
-- The cleanup thread has a 20s timeout before force-exit
+| Symptom | Fix |
+|---------|-----|
+| "Startup failed" | Run `pip install foundry-local-sdk` or `winget install Microsoft.FoundryLocal` |
+| "No models found" | Download a model in AI Toolkit  Models  Download, then click  |
+| Model not responding | Click  to retry; if stuck, close and reopen the app |
+| Slow first load | Large models (67 GB) can take 23 min; subsequent loads are faster |
 
 ---
 
-## 🏗️ Building the Executable
-
-Requires PyInstaller:
+##  Building the Executable
 
 ```powershell
 pip install pyinstaller
-
-# Build:
-pyinstaller --onefile --windowed --name "ProjectVera" `
-  --icon "Logo/icon.ico" `
-  --collect-all PySide6 `
-  --collect-all openai `
-  --collect-all httpx `
-  --collect-all foundry_local `
-  --noconfirm app.py
-
-# Output: dist\ProjectVera.exe (~260MB)
+pyinstaller ProjectVera.spec
+# Output: dist\ProjectVera.exe
 ```
 
 ---
 
-## 📦 What's Included
+##  Repository Layout
 
 ```
 .
-├── app.py                    # Single-file application (1,198 lines)
-├── requirements.txt          # Python dependencies
-├── Logo/
-│   └── icon.ico             # V logo (taskbar + window icon)
-├── dist/
-│   └── ProjectVera.exe      # Pre-built executable
-└── README.md                # This file
+ app.py              # Single-file application (~2,300 lines)
+ ProjectVera.spec    # PyInstaller build spec
+ requirements.txt    # Python dependencies
+ Logo/
+    icon.ico        # App icon (taskbar + window)
+    *.png           # Source artwork
+ README.md
 ```
 
 ---
 
-## 🔐 Privacy & Security
+##  Privacy & Security
 
-- ✅ **Zero cloud dependency** — All data stays on your PC
-- ✅ **Zero telemetry** — No tracking, no analytics
-- ✅ **Open source** — Inspect the code yourself
-- ✅ **Local-only inference** — Models run on your hardware
-
-Foundry Local does **not** upload models or responses to Microsoft or any cloud service.
+-  Zero cloud dependency  all data stays on your PC
+-  Zero telemetry  no tracking, no analytics
+-  Open source  inspect the code yourself
+-  Local-only inference  models run on your hardware
 
 ---
 
-## 🤝 Contributing
+##  Contributing
 
-This is a personal project, but feel free to fork and adapt!
+Personal project  feel free to fork and adapt!
 
 **Known limitations:**
-- Windows only (uses ctypes Win32 API)
+- Windows only (uses ctypes Win32 API for window chrome and resize)
 - Requires Foundry Local (Microsoft's local inference runtime)
-- Chat history not persisted between sessions (in-memory only)
 
 ---
 
-## 📝 License
+##  License
 
-Apache 2.0 — See LICENSE file for details.
-
----
-
-## 🙏 Acknowledgments
-
-- **Microsoft Foundry Local** — Local inference runtime
-- **PySide6** — Qt bindings for Python
-- **OpenAI SDK** — OpenAI-compatible chat completions
-- **pypdf** — PDF parsing
+Apache 2.0  see LICENSE file for details.
 
 ---
 
-## 📧 Questions?
+##  Acknowledgments
 
-If Foundry Local isn't working:
-1. Verify it's installed: `foundry --version`
-2. Check status: `foundry service status`
-3. Restart service: `foundry service restart`
-4. Download a model: Open AI Toolkit → Models → Download
-
-If the app crashes, check the Python console output for the error message.
+- **Microsoft Foundry Local**  local inference runtime
+- **PySide6**  Qt bindings for Python
+- **OpenAI SDK**  OpenAI-compatible chat completions
+- **pypdf**  PDF parsing
 
 ---
 
-**Project Vera — Chat locally, think freely.** 🧠✨
+**Project Vera  Chat locally, think freely.** 

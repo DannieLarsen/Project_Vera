@@ -26,7 +26,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-from PySide6.QtCore import Qt, Signal, QObject, QThread, QPoint, QTimer, QPropertyAnimation, QEasingCurve, QSize
+from PySide6.QtCore import Qt, QEvent, Signal, QObject, QThread, QPoint, QRect, QTimer, QPropertyAnimation, QEasingCurve, QSize
 from PySide6.QtGui import QFont, QColor, QPalette, QTextCursor, QIcon, QPainter
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -603,6 +603,33 @@ class BitDogWidget(QWidget):
         ],
     ]
 
+    # Front-facing face frames for sit() mode.
+    # 'R' state = ears perked UP, 'L' state = ears flopped DOWN.
+    _FS_UP = [
+        [0,1,1,0,0,0,0,0,0,0,1,1,0],  # ear tips
+        [0,1,1,0,0,0,0,0,0,0,1,1,0],  # ears
+        [0,1,1,1,1,1,1,1,1,1,1,1,0],  # head top merges with ears
+        [0,0,1,1,1,1,1,1,1,1,1,0,0],  # head
+        [0,0,1,3,1,1,1,1,1,3,1,0,0],  # eyes
+        [0,0,1,1,1,1,1,1,1,1,1,0,0],  # face
+        [0,0,1,1,1,2,2,2,1,1,1,0,0],  # nose
+        [0,0,0,1,1,1,1,1,1,1,0,0,0],  # lower face
+        [0,0,0,0,1,1,1,1,1,0,0,0,0],  # chin
+        [0,0,0,0,0,0,0,0,0,0,0,0,0],  # empty
+    ]
+    _FS_DOWN = [
+        [0,0,0,0,0,0,0,0,0,0,0,0,0],  # empty (ears no longer up)
+        [0,0,0,1,1,1,1,1,1,1,0,0,0],  # head top
+        [0,1,1,1,1,1,1,1,1,1,1,1,0],  # head full width, ears attach
+        [0,1,0,1,1,1,1,1,1,1,0,1,0],  # ears drooping at cols 1 & 11
+        [0,1,0,1,3,1,1,1,3,1,0,1,0],  # eyes + ears
+        [0,1,0,1,1,1,1,1,1,1,0,1,0],  # face + ears
+        [0,0,0,1,1,2,2,2,1,1,0,0,0],  # nose
+        [0,0,0,1,1,1,1,1,1,1,0,0,0],  # lower face
+        [0,0,0,0,1,1,1,1,1,0,0,0,0],  # chin
+        [0,0,0,0,0,0,0,0,0,0,0,0,0],  # empty
+    ]
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(self.H_CELLS * self.SCALE + 10)
@@ -615,11 +642,16 @@ class BitDogWidget(QWidget):
             'R': self._FR,
             'L': [[list(reversed(row)) for row in f] for f in self._FR],
         }
+        self._sit_frames = {
+            'R': self._FS_UP,   # ears perked up
+            'L': self._FS_DOWN, # ears flopped down
+        }
 
         self._x     = 0
         self._dir   = 1      # +1 right, -1 left
         self._face  = 'R'
         self._frame = 0
+        self._sit   = False
 
         self._col_body = QColor(ACCENT)
         self._col_dark = QColor(ACCENT).darker(180)
@@ -627,19 +659,40 @@ class BitDogWidget(QWidget):
 
         self._move_timer  = QTimer(self)
         self._frame_timer = QTimer(self)
+        self._sit_timer   = QTimer(self)
         self._move_timer.timeout.connect(self._tick_move)
         self._frame_timer.timeout.connect(self._tick_frame)
+        self._sit_timer.timeout.connect(self._tick_sit)
 
     def start(self):
+        self._sit = False
         self._x, self._dir, self._face, self._frame = 0, 1, 'R', 0
         self.show()
+        self._sit_timer.stop()
         self._move_timer.start(self.MOVE_MS)
         self._frame_timer.start(self.FRAME_MS)
+
+    def sit(self, flip_ms: int = 2000):
+        """Stationary sit pose — flips direction every flip_ms milliseconds."""
+        self._sit = True
+        self._face  = 'R'
+        self._frame = 0
+        self._x     = 0
+        self.show()
+        self._move_timer.stop()
+        self._frame_timer.stop()
+        self._sit_timer.start(flip_ms)
 
     def stop(self):
         self._move_timer.stop()
         self._frame_timer.stop()
+        self._sit_timer.stop()
+        self._sit = False
         self.hide()
+
+    def _tick_sit(self):
+        self._face = 'L' if self._face == 'R' else 'R'
+        self.update()
 
     def _tick_move(self):
         sprite_w = self.W_CELLS * self.SCALE
@@ -658,8 +711,14 @@ class BitDogWidget(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        grid  = self._frames[self._face][self._frame]
-        s     = self.SCALE
+        if self._sit:
+            grid  = self._sit_frames[self._face]
+            s     = self.SCALE
+            x_off = max(0, (self.width() - self.W_CELLS * s) // 2)
+        else:
+            grid  = self._frames[self._face][self._frame]
+            s     = self.SCALE
+            x_off = self._x
         y_off = (self.height() - self.H_CELLS * s) // 2
         for r, row in enumerate(grid):
             for c, cell in enumerate(row):
@@ -668,7 +727,7 @@ class BitDogWidget(QWidget):
                 color = (self._col_body if cell == 1
                          else self._col_dark if cell == 2
                          else self._col_eye)
-                painter.fillRect(self._x + c * s, y_off + r * s, s, s, color)
+                painter.fillRect(x_off + c * s, y_off + r * s, s, s, color)
         painter.end()
 
 
@@ -793,6 +852,7 @@ class ChatWindow(QMainWindow):
         self.resize(1100, 720)
         self._drag_pos = QPoint()
         self.setAcceptDrops(True)
+        QApplication.instance().installEventFilter(self)
 
         # OpenAI client — created after the SDK discovers the dynamic port
         self.client: OpenAI | None = None
@@ -956,12 +1016,12 @@ class ChatWindow(QMainWindow):
         actual_w = 0 if self._sidebar_collapsed else self._sidebar_width
         self._sidebar.setMinimumWidth(actual_w)
         self._sidebar.setMaximumWidth(actual_w)
-        self._collapse_btn.setText("▶" if self._sidebar_collapsed else "◀")
         self._burger_btn.setToolTip(
             "Show history panel  (Ctrl+\\)" if self._sidebar_collapsed
             else "Hide history panel  (Ctrl+\\)"
         )
-        self._last_session_id = cfg.get("chat", {}).get("current_session_id", "")
+        # Always start with a fresh blank chat — never restore last session
+        self._last_session_id = ""
 
     # ── Sidebar toggle ────────────────────────────────────────────────────────
     def _toggle_sidebar(self):
@@ -981,16 +1041,11 @@ class ChatWindow(QMainWindow):
             a.setEndValue(target_w)
             a.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
 
-        # Update burger tooltip; inner collapse btn mirrors state
+        # Update burger tooltip
         collapsed = self._sidebar_collapsed
         self._burger_btn.setToolTip(
             "Show history panel  (Ctrl+\\)" if collapsed
             else "Hide history panel  (Ctrl+\\)"
-        )
-        self._collapse_btn.setText("▶" if collapsed else "◀")
-        self._collapse_btn.setToolTip(
-            "Expand sidebar  (Ctrl+\\)" if collapsed
-            else "Collapse sidebar  (Ctrl+\\)"
         )
 
     def keyPressEvent(self, event):
@@ -1157,11 +1212,12 @@ class ChatWindow(QMainWindow):
             if item.widget():
                 item.widget().deleteLater()
         # Re-add welcome label
-        welcome = QLabel("How can I help you today?")
+        welcome = QLabel("Where should we begin?")
         welcome.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        welcome.setWordWrap(True)
         welcome.setStyleSheet(
-            f"color: {TEXT_MUTED}; font-size: 20px; font-weight: 600; "
-            "background: transparent; padding: 40px 0;"
+            f"color: {ACCENT}; font-size: 42px; font-weight: 700; "
+            "background: transparent; padding: 40px 20px;"
         )
         self.feed_layout.insertWidget(0, welcome)
         self._welcome_label = welcome
@@ -1303,8 +1359,9 @@ class ChatWindow(QMainWindow):
         h_layout.setContentsMargins(16, 0, 8, 0)
         h_layout.setSpacing(8)
 
-        dot = QLabel("●")
-        dot.setStyleSheet(f"color: {ACCENT}; font-size: 14px; background: transparent;")
+        title_dog = BitDogWidget()
+        title_dog.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        title_dog.setFixedWidth(46)
 
         title = QLabel("Project Vera")
         title.setStyleSheet(
@@ -1373,6 +1430,7 @@ class ChatWindow(QMainWindow):
         min_btn.clicked.connect(self.showMinimized)
 
         max_btn = QPushButton("□")
+        self._max_btn = max_btn
         max_btn.setStyleSheet(btn_style % {"size": "16px"})
         max_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         max_btn.setToolTip("Maximise")
@@ -1406,8 +1464,7 @@ class ChatWindow(QMainWindow):
 
         h_layout.addWidget(self._burger_btn)
         h_layout.addSpacing(4)
-        h_layout.addWidget(dot)
-        h_layout.addSpacing(6)
+        h_layout.addWidget(title_dog)
         h_layout.addWidget(title)
         h_layout.addSpacing(12)
         h_layout.addWidget(self.model_combo)
@@ -1419,6 +1476,7 @@ class ChatWindow(QMainWindow):
         h_layout.addWidget(max_btn)
         h_layout.addWidget(close_btn)
         root.addWidget(self.title_bar)
+        title_dog.sit(flip_ms=2000)
 
         # ── Body: sidebar + chat pane ───────────────────────────────────────
         body = QWidget()
@@ -1436,6 +1494,7 @@ class ChatWindow(QMainWindow):
             QFrame#sidebar {{
                 background-color: {BG_PANEL};
                 border-right: 1px solid {BORDER};
+                border-bottom-left-radius: 10px;
             }}
         """)
         sidebar_layout = QVBoxLayout(self._sidebar)
@@ -1452,32 +1511,17 @@ class ChatWindow(QMainWindow):
         sb_h.setContentsMargins(14, 0, 8, 0)
         sb_h.setSpacing(6)
 
-        sb_title = QLabel("💬  History")
+        sb_title = QLabel("History")
         sb_title.setStyleSheet(
             f"color: {TEXT_PRIMARY}; font-size: 13px; font-weight: 600; background: transparent;"
         )
 
-        # Toggle collapse button (◀ / ▶)
-        self._collapse_btn = QPushButton("◀")
-        self._collapse_btn.setFixedSize(28, 28)
-        self._collapse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._collapse_btn.setToolTip("Collapse sidebar  (Ctrl+\\)")
-        self._collapse_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent; border: none;
-                color: {TEXT_MUTED}; font-size: 13px; border-radius: 6px;
-            }}
-            QPushButton:hover {{ background: rgba(232,102,10,0.15); color: {ACCENT}; }}
-        """)
-        self._collapse_btn.clicked.connect(self._toggle_sidebar)
-
         sb_h.addWidget(sb_title, stretch=1)
-        sb_h.addWidget(self._collapse_btn)
         sidebar_layout.addWidget(sb_header)
 
         # Search bar
         self._search_field = QLineEdit()
-        self._search_field.setPlaceholderText("🔍  Search conversations…")
+        self._search_field.setPlaceholderText("Search conversations…")
         self._search_field.setFixedHeight(34)
         self._search_field.setStyleSheet(f"""
             QLineEdit {{
@@ -1525,16 +1569,26 @@ class ChatWindow(QMainWindow):
         sidebar_layout.addWidget(self._session_list, stretch=1)
 
         # New Chat button
-        new_chat_btn = QPushButton("➕  New Chat")
+        new_chat_btn = QPushButton("+ New Chat")
         new_chat_btn.setFixedHeight(42)
         new_chat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         new_chat_btn.setStyleSheet(f"""
             QPushButton {{
-                background-color: {ACCENT}; color: #ffffff;
-                border: none; border-top: 1px solid {BORDER};
+                background-color: transparent;
+                color: {ACCENT};
+                border: none;
+                border-top: 1px solid {BORDER};
+                border-bottom-left-radius: 10px;
                 font-size: 13px; font-weight: 600; padding: 0 16px;
+                letter-spacing: 0.5px;
             }}
-            QPushButton:hover {{ background-color: {ACCENT_HOVER}; }}
+            QPushButton:hover {{
+                background-color: rgba(232, 102, 10, 0.12);
+                color: {ACCENT_HOVER};
+            }}
+            QPushButton:pressed {{
+                background-color: rgba(232, 102, 10, 0.22);
+            }}
         """)
         new_chat_btn.clicked.connect(self._new_chat)
         sidebar_layout.addWidget(new_chat_btn)
@@ -1574,11 +1628,12 @@ class ChatWindow(QMainWindow):
         chat_layout.addWidget(self.scroll_area, stretch=1)
 
         # Welcome message
-        welcome = QLabel("How can I help you today?")
+        welcome = QLabel("Where should we begin?")
         welcome.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        welcome.setWordWrap(True)
         welcome.setStyleSheet(
-            f"color: {TEXT_MUTED}; font-size: 20px; font-weight: 600; "
-            "background: transparent; padding: 40px 0;"
+            f"color: {ACCENT}; font-size: 42px; font-weight: 700; "
+            "background: transparent; padding: 40px 20px;"
         )
         self.feed_layout.insertWidget(0, welcome)
         self._welcome_label = welcome
@@ -1791,6 +1846,77 @@ class ChatWindow(QMainWindow):
     def _tb_double_click(self, event):
         self._toggle_maximise()
 
+    # ── Edge / corner resize ──────────────────────────────────────────────────
+    # The outer layout has a 12px transparent shadow margin, so the visible
+    # container starts at (12, 12).  Corner zones must lie inside that content.
+    _SHADOW_MARGIN  = 12   # transparent bleed around the container
+    _RESIZE_MARGIN  = 22   # extra px of visible content included in corner zone
+
+    def _resize_edge_at(self, pos: QPoint):
+        """Return corner tag or None.  Zone starts at shadow edge into content."""
+        if self.isMaximized():
+            return None
+        sh = self._SHADOW_MARGIN
+        m  = self._RESIZE_MARGIN
+        x, y, w, h = pos.x(), pos.y(), self.width(), self.height()
+        left   = x < sh + m
+        right  = x >= w - sh - m
+        top    = y < sh + m
+        bottom = y >= h - sh - m
+        if top    and left:  return 'tl'
+        if top    and right: return 'tr'
+        if bottom and left:  return 'bl'
+        if bottom and right: return 'br'
+        return None
+
+    _EDGE_CURSORS = {
+        'tl': Qt.CursorShape.SizeFDiagCursor,
+        'br': Qt.CursorShape.SizeFDiagCursor,
+        'tr': Qt.CursorShape.SizeBDiagCursor,
+        'bl': Qt.CursorShape.SizeBDiagCursor,
+    }
+
+    def eventFilter(self, obj, event):
+        """App-wide filter: show resize cursor + start native corner resize."""
+        etype = event.type()
+        if etype == QEvent.Type.MouseMove:
+            try:
+                gpos = event.globalPosition().toPoint()
+            except AttributeError:
+                return False
+            pos = self.mapFromGlobal(gpos)
+            edge = self._resize_edge_at(pos)
+            if edge:
+                self.setCursor(self._EDGE_CURSORS[edge])
+            else:
+                self.unsetCursor()
+        elif etype == QEvent.Type.MouseButtonPress:
+            try:
+                if event.button() != Qt.MouseButton.LeftButton:
+                    return False
+                gpos = event.globalPosition().toPoint()
+            except AttributeError:
+                return False
+            pos  = self.mapFromGlobal(gpos)
+            edge = self._resize_edge_at(pos)
+            if edge:
+                self._start_corner_resize(edge)
+                return True
+        return False
+
+    def _start_corner_resize(self, edge):
+        """Tell Windows to start a native resize from the given corner."""
+        if sys.platform != "win32":
+            return
+        import ctypes
+        # WMSZ constants: 4=TOPLEFT 5=TOPRIGHT 7=BOTTOMLEFT 8=BOTTOMRIGHT
+        dir_map = {'tl': 4, 'tr': 5, 'bl': 7, 'br': 8}
+        hwnd = int(self.winId())
+        ctypes.windll.user32.ReleaseCapture()
+        ctypes.windll.user32.SendMessageW(
+            hwnd, 0x0112, 0xF000 + dir_map[edge], 0
+        )
+
     def _toggle_maximise(self):
         if self.isMaximized():
             self.showNormal()
@@ -1800,8 +1926,78 @@ class ChatWindow(QMainWindow):
     def showEvent(self, event):
         super().showEvent(event)
         if sys.platform == "win32":
+            self._apply_win32_thick_frame()
             # Delay until the Win32 taskbar button has been created
             QTimer.singleShot(150, self._apply_win32_taskbar_icon)
+
+    def nativeEvent(self, eventType, message):
+        """Handle WM_NCCALCSIZE + WM_NCHITTEST for Snap Layout support."""
+        if sys.platform == "win32" and eventType == b"windows_generic_MSG":
+            import ctypes
+            import ctypes.wintypes as wt
+
+            class _MSG(ctypes.Structure):
+                _fields_ = [
+                    ("hwnd",    wt.HWND),
+                    ("message", wt.UINT),
+                    ("wParam",  wt.WPARAM),
+                    ("lParam",  wt.LPARAM),
+                    ("time",    wt.DWORD),
+                    ("ptX",     wt.LONG),
+                    ("ptY",     wt.LONG),
+                ]
+
+            msg = ctypes.cast(int(message), ctypes.POINTER(_MSG)).contents
+
+            if msg.message == 0x0083 and msg.wParam:  # WM_NCCALCSIZE
+                # Return 0 → entire window rect is client area; strips native
+                # title bar chrome while keeping WS_CAPTION snap capabilities.
+                return True, 0
+
+            if msg.message == 0x0084:  # WM_NCHITTEST
+                sx = ctypes.c_int16(msg.lParam & 0xFFFF).value
+                sy = ctypes.c_int16((msg.lParam >> 16) & 0xFFFF).value
+                pos = self.mapFromGlobal(QPoint(sx, sy))
+                sh  = self._SHADOW_MARGIN  # 12 px transparent shadow margin
+
+                # Maximize button → triggers Win11 Snap Layout flyout on hover
+                if hasattr(self, '_max_btn') and not self.isMaximized():
+                    bp = self._max_btn.mapTo(self, QPoint(0, 0))
+                    br = QRect(bp, self._max_btn.size())
+                    if br.contains(pos):
+                        return True, 9  # HTMAXBUTTON
+
+                # Title bar → AeroSnap drag-to-edge / snap zones
+                if (sh < pos.x() < self.width() - sh
+                        and sh < pos.y() < sh + self.title_bar.height()):
+                    # Let interactive controls (buttons, combo) handle their
+                    # own clicks — only treat empty space as caption.
+                    child = self.childAt(pos)
+                    if child is not None:
+                        from PySide6.QtWidgets import QAbstractButton, QComboBox
+                        if isinstance(child, (QAbstractButton, QComboBox)):
+                            return True, 1  # HTCLIENT
+                    return True, 2  # HTCAPTION
+
+        return super().nativeEvent(eventType, message)
+
+    def _apply_win32_thick_frame(self):
+        """Add WS_THICKFRAME + WS_CAPTION so Windows enables Snap Layout."""
+        try:
+            import ctypes
+            GWL_STYLE     = -16
+            WS_THICKFRAME = 0x00040000
+            WS_CAPTION    = 0x00C00000  # required for snap layout
+            hwnd  = int(self.winId())
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style | WS_THICKFRAME | WS_CAPTION)
+            # Notify Windows of frame change without moving/sizing the window
+            ctypes.windll.user32.SetWindowPos(
+                hwnd, None, 0, 0, 0, 0,
+                0x0001 | 0x0002 | 0x0004 | 0x0020  # NOSIZE|NOMOVE|NOZORDER|FRAMECHANGED
+            )
+        except Exception:
+            pass
 
     def _apply_win32_taskbar_icon(self):
         """Force the correct icon onto the Win32 taskbar button.
