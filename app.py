@@ -1195,7 +1195,9 @@ class ChatWindow(QMainWindow):
         self._hc_thread.start()
 
     def _on_connected(self):
-        self.status_label.setText("● Ready")
+        model_label = _model_display_name(self._active_model) if self._active_model else ""
+        status_text = f"● {model_label} — Ready" if model_label else "● Ready"
+        self.status_label.setText(status_text)
         self.status_label.setStyleSheet(f"color: #4caf50; font-size: 11px; background: transparent;")
         self.retry_btn.hide()
         self.send_btn.setEnabled(True)  # safe for both startup and post-switch
@@ -1480,6 +1482,12 @@ class ChatWindow(QMainWindow):
                 self._model_map[display] = alias
                 self._id_map[alias] = model_id
                 self.model_combo.addItem(display)
+                # Store the raw model ID as item tooltip so hovering shows exact name
+                self.model_combo.setItemData(
+                    self.model_combo.count() - 1,
+                    alias,
+                    Qt.ItemDataRole.ToolTipRole
+                )
             self.model_combo.setCurrentIndex(0)
             self.model_combo.blockSignals(False)
             self.model_combo.show()
@@ -1541,10 +1549,12 @@ class ChatWindow(QMainWindow):
             if idx >= 0:
                 self.model_combo.setCurrentIndex(idx)
             self.model_combo.blockSignals(False)
+        # Show the raw model ID as a combo tooltip so the user can always verify
+        self.model_combo.setToolTip(f"Active model: {self._active_model_id}")
         self.model_combo.setEnabled(True)
         if self._is_ollama():
             # Ollama auto-loads on first token — mark as ready immediately
-            self.status_label.setText("● Ready  (model loads on first message)")
+            self.status_label.setText(f"● {_model_display_name(new_model)} — Ready")
             self.status_label.setStyleSheet(
                 f"color: #4caf50; font-size: 11px; background: transparent;"
             )
@@ -2624,6 +2634,12 @@ class ChatWindow(QMainWindow):
             return
 
         self.input_field.clear()
+        # Safety guard: should never happen, but prevents sending to the wrong model
+        if not self._active_model_id:
+            bubble = self._add_bubble("assistant")
+            bubble.set_text("⚠ No model selected.\nPlease select a model from the drop-down before sending.")
+            self._reset_send_btn()
+            return
         # Transform Send → Stop while streaming
         self.send_btn.setText("■ Stop")
         self.send_btn.setStyleSheet("""
@@ -2727,6 +2743,30 @@ class ChatWindow(QMainWindow):
             f"color: {TEXT_MUTED}; font-size: 11px; background: transparent;"
         )
 
+    def _reset_send_btn(self):
+        """Restore the Send button to its default state (used after streaming ends or on error)."""
+        self.send_btn.setText("Send")
+        self.send_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {ACCENT}; color: #ffffff;
+                border: none; border-radius: 8px;
+                font-size: 14px; font-weight: 600;
+            }}
+            QPushButton:hover {{ background-color: {ACCENT_HOVER}; }}
+            QPushButton:disabled {{ background-color: {BORDER}; color: {TEXT_MUTED}; }}
+        """)
+        self.send_btn.setEnabled(True)
+        try:
+            self.send_btn.clicked.disconnect()
+        except Exception:
+            pass
+        self.send_btn.clicked.connect(self._send_message)
+        self.input_field.setFocus()
+        model_label = _model_display_name(self._active_model) if self._active_model else ""
+        status_text = f"● {model_label} — Ready" if model_label else "● Ready"
+        self.status_label.setText(status_text)
+        self.status_label.setStyleSheet(f"color: #4caf50; font-size: 11px; background: transparent;")
+
     def _on_error(self, error: str):
         if self._current_bubble:
             self._current_bubble.stop_thinking()
@@ -2750,27 +2790,9 @@ class ChatWindow(QMainWindow):
                     self._current_session.updated_at = datetime.utcnow().isoformat()
                     self._update_session_in_list(self._current_session)
 
-        # Restore Stop → Send button
-        self.send_btn.setText("Send")
-        self.send_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {ACCENT}; color: #ffffff;
-                border: none; border-radius: 8px;
-                font-size: 14px; font-weight: 600;
-            }}
-            QPushButton:hover {{ background-color: {ACCENT_HOVER}; }}
-            QPushButton:disabled {{ background-color: {BORDER}; color: {TEXT_MUTED}; }}
-        """)
-        self.send_btn.setEnabled(True)
-        try:
-            self.send_btn.clicked.disconnect()
-        except Exception:
-            pass
-        self.send_btn.clicked.connect(self._send_message)
-        self.input_field.setFocus()
-        self.status_label.setText("● Ready")
-        self.status_label.setStyleSheet(f"color: #4caf50; font-size: 11px; background: transparent;")
+        self._reset_send_btn()
         self._current_bubble = None
+
 
     def closeEvent(self, event):
         """Save config, shut down DB, stop Foundry on close."""
