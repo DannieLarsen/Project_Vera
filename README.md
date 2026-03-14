@@ -1,50 +1,56 @@
-# Project Vera  Local AI Desktop Chatbot
+# Project Vera — Local AI Desktop Chatbot
 
-A polished, local-first AI chat application powered by Microsoft Foundry Local. Chat with AI models running entirely on your machine  no cloud, no subscriptions, no data sent anywhere.
+A polished, privacy-first AI chat application for Windows that runs entirely on your machine.  
+Choose between **Microsoft Foundry Local** or **Ollama** at launch — no cloud, no subscriptions, no data leaves your PC.
 
-**License:** Apache 2.0 (free, open-source)
-
----
-
-##  Features
-
--  **100% Local**  All models and inference run on your PC via Foundry Local
--  **Multi-Model Support**  Swap between any Foundry-cached model with one click
--  **Streaming Responses**  Real-time token streaming with a Stop button
--  **Stream Retry**  Automatically recovers from transient stream errors
--  **File Attachments**  Drag-and-drop support for text, code, PDFs, and more
--  **Persistent Chat History**  All sessions saved in SQLite; browse from the sidebar
--  **Polished UI**  Frameless window, custom title bar with pixel-art BitDog mascot, orange accent
--  **Windows 11 Snap Layout**  Hover the maximise button to see the snap grid; drag the title bar to snap zones
--  **Corner Resize**  Drag any corner to resize (Win32 SC_SIZE, no native chrome)
--  **Auto-Management**  Service and model auto-start/stop with graceful cleanup
--  **Fast Model Loading**  Uses official `foundry-local-sdk` for synchronous, reliable loading
+**License:** Apache 2.0 · Windows 10 / 11
 
 ---
 
-##  Getting Started
+## ✨ Features
+
+| | |
+|---|---|
+| 🔒 **100% Local** | All inference runs on your PC — zero cloud calls, zero telemetry |
+| ⚡ **Dual Backend** | Pick **Foundry Local** or **Ollama** from the visual launcher every time you open the app |
+| 🔁 **Remembered Choice** | Your last backend is saved and pre-started automatically on next launch |
+| 🔀 **Switch Anytime** | A badge in the title bar lets you swap backends without restarting |
+| 🤖 **Multi-Model** | Swap between any locally available model with one click |
+| 📡 **Streaming Responses** | Real-time token streaming with a Stop button and auto-retry on transient errors |
+| 📎 **File Attachments** | Drag-and-drop `.txt`, `.py`, `.pdf`, `.csv`, `.json`, `.md` and more |
+| 🗂️ **Persistent History** | All sessions stored in SQLite; browse, search, pin and rename from the sidebar |
+| 🐶 **BitDog Mascot** | Pixel-art dog that walks while the model thinks, sits in the title bar |
+| 🪟 **Windows 11 Snap Layout** | Hover the maximise button for the snap grid; drag the title bar to snap zones |
+| 📐 **Corner Resize** | Native Win32 corner-drag resize — no flicker, no borders |
+
+---
+
+## 🚀 Getting Started
 
 ### Prerequisites
 
-1. **Windows 10/11** (Win32 APIs used for window chrome)
-2. **Foundry Local** installed:
-   ```powershell
-   winget install Microsoft.FoundryLocal
-   ```
-3. **Python 3.10+**
-4. **At least one cached model** (download via AI Toolkit  Models)
+- **Windows 10 / 11**
+- **Python 3.10+**
+- At least one of the backends installed:
 
-### Installation
+| Backend | Install |
+|---------|---------|
+| Foundry Local | `winget install Microsoft.FoundryLocal` then download a model via **AI Toolkit → Models** |
+| Ollama | `winget install Ollama.Ollama` then `ollama pull llama3.2` (or any model) |
+
+### Install from source
 
 ```powershell
-git clone <repo-url>
-cd "Basic Local Agent"
+git clone https://github.com/DannieLarsen/Project_Vera.git
+cd Project_Vera
 python -m venv venv
 .\venv\Scripts\activate
-pip install -r requirements.txt
+pip install PySide6 openai pypdf
+# Optional — only needed if using Foundry Local:
+pip install foundry-local-sdk
 ```
 
-### Running from source
+### Run
 
 ```powershell
 python app.py
@@ -58,146 +64,171 @@ python app.py
 
 ---
 
-##  Architecture
+## 🖥️ Usage
 
-### Code Structure
+1. **Launch** — the backend picker appears
+2. **Choose Foundry Local or Ollama** — your choice is saved for next time
+3. **Select a model** from the title-bar drop-down
+4. **Wait for "● Ready"** in the status bar
+5. **Chat** — type a message or drag-and-drop a file
+6. **Browse history** — click ☰ to open the session sidebar
+7. **Switch backend** — click the `Foundry` / `Ollama` badge in the title bar at any time
+8. **Snap / resize** — hover □ for Win11 Snap Layout, or drag any corner
+
+### Drag-and-Drop File Formats
+
+`.txt` · `.md` · `.log` · `.csv` · `.json` · `.py` · `.js` · `.html` · `.xml` · `.yaml` · `.toml` · `.ini` · `.cfg` · `.pdf`
+
+---
+
+## 🏗️ Architecture
 
 ```
-app.py (~2,300 lines, single-file application)
- FoundryManager (QObject)
-    start_foundry()           Init SDK, discover dynamic port
-    load_model(alias)         Synchronous load via SDK
-    unload_model()            Unload via SDK
-    list_cached()             List cached models
-
- ModelListWorker               Fetch model list in background thread
- ModelSwitchWorker             Unload old / load new model
- StreamWorker                  Stream chat completions with retry
- HealthCheckWorker             Poll endpoint until warm
-
- BitDogWidget (QWidget)        Pixel-art dog mascot
-    start()                   Walking animation
-    sit(flip_ms)              Front-facing ear-flap animation
-    stop()                    Idle
-
- ChatWindow (QMainWindow)
-    Frameless window with WS_THICKFRAME + WS_CAPTION
-    nativeEvent  WM_NCCALCSIZE strips chrome; WM_NCHITTEST drives Snap Layout
-    eventFilter  corner-zone detection  Win32 SC_SIZE resize
-    Custom title bar (burger menu, BitDog, title, model selector, window controls)
-    Chat history sidebar (SQLite, 6-month auto-cleanup)
-    Message feed with streaming bubbles
-    Drag-and-drop file support
-
- MessageBubble (QFrame)        Individual chat message with Markdown rendering
+app.py  (single-file, ~2 800 lines)
+│
+├── FoundryManager (QObject)
+│     start_foundry()     Bootstrap SDK, discover dynamic port
+│     load_model(alias)   Synchronous load via foundry-local-sdk
+│     unload_model()      Unload cleanly on model switch / exit
+│     list_cached()       List all locally cached models
+│
+├── OllamaManager (QObject)
+│     start_ollama()      Verify Ollama reachable at localhost:11434
+│     load_model(name)    No-op — Ollama auto-loads on first inference
+│     list_cached()       GET /api/tags → list of pulled models
+│
+├── ModelListWorker        Background thread — fetch model list from active backend
+├── ModelSwitchWorker      Unload old / load new (Foundry); instant select (Ollama)
+├── StreamWorker           Stream chat completions with 1-retry on transient errors
+├── HealthCheckWorker      Poll endpoint until warm (Foundry only)
+│
+├── BitDogWidget (QWidget)
+│     start()             Walking animation (while model is thinking)
+│     sit(flip_ms)        Front-facing ear-flap (title bar)
+│     stop()              Hide
+│
+└── ChatWindow (QMainWindow)
+      QStackedWidget
+        Page 0: Backend picker  — two logo cards, Foundry | Ollama
+        Page 1: Chat UI
+          Custom title bar  (☰ burger · BitDog · title · backend badge · model combo · window controls)
+          Session sidebar   (SQLite, 6-month auto-cleanup, search, pin, rename, delete)
+          Message feed      (streaming bubbles, markdown code blocks)
+          Input bar         (text field + Send/Stop + drag-and-drop attachment chip)
+      Win32 integration
+          WS_THICKFRAME + WS_CAPTION  → Snap Layout support
+          WM_NCCALCSIZE               → strips native chrome
+          WM_NCHITTEST                → HTCAPTION / HTMAXBUTTON
+          SC_SIZE corner drag         → flicker-free resize
 ```
 
 ### Key Design Decisions
 
 | Concern | Approach |
 |---------|----------|
-| Port discovery | `FoundryLocalManager.endpoint` (dynamic port, not hardcoded 5272) |
-| Model loading | `sdk.load_model()`  synchronous, blocks until ready |
-| Snap Layout | `WS_CAPTION` + `WM_NCHITTEST  HTMAXBUTTON / HTCAPTION` |
-| Corner resize | `WM_SYSCOMMAND SC_SIZE` via Win32  smooth, no flicker |
-| Chat persistence | SQLite via `sqlite3` stdlib  zero extra dependency |
-| Stream reliability | Exponential-back-off retry on `APIConnectionError` / `APIStatusError` |
+| Dual backend | Common `status_update / ready / failed` signal contract; `StreamWorker` / `OpenAI` client unchanged |
+| Foundry port | `FoundryLocalManager.endpoint` — dynamic, not hardcoded |
+| Ollama endpoint | Fixed `http://localhost:11434/v1` — OpenAI-compatible, no extra SDK |
+| Model loading | Foundry: synchronous `sdk.load_model()` + health-check; Ollama: instant select, auto-loads on first token |
+| Snap Layout | `WS_CAPTION` + `WM_NCHITTEST → HTMAXBUTTON / HTCAPTION` |
+| Corner resize | `WM_SYSCOMMAND SC_SIZE` via Win32 — smooth, no flicker |
+| Chat persistence | SQLite via `sqlite3` stdlib — zero extra dependency |
+| App icon | BitDog head rendered at runtime into a 7-size `QIcon`; embedded in the `.exe` via `bitdog.ico` |
 
 ---
 
-##  Requirements
+## 📦 Requirements
 
 ```
-PySide6>=6.7          # Qt UI framework
-openai>=1.42          # OpenAI-compatible client
-foundry-local-sdk     # Official Foundry SDK
-pypdf                 # PDF attachment support
+PySide6>=6.7          # Qt6 UI framework
+openai>=1.42          # OpenAI-compatible chat completions client
+pypdf                 # PDF attachment reading (optional)
+foundry-local-sdk     # Foundry Local backend (optional)
 ```
 
----
-
-##  Usage
-
-1. **Launch**  Foundry Local service auto-starts
-2. **Select a model** from the title-bar drop-down  loads synchronously
-3. **Wait for "Ready"** in the status bar
-4. **Chat**  type or drag-and-drop files
-5. **Browse history**  click the  burger menu to open the sidebar
-6. **Snap**  hover the  button for Win11 Snap Layout, or drag the title bar to an edge
-7. **Close**  model unloads cleanly; service keeps running for other apps
-
-### Drag-and-Drop Supported Formats
-
-- Text / code: `.txt`, `.md`, `.log`, `.csv`, `.json`, `.py`, `.js`, `.html`, `.xml`, `.yaml`, `.toml`, `.ini`, `.cfg`
-- Documents: `.pdf`
+> Ollama requires no Python package — it exposes a built-in REST API.
 
 ---
 
-##  Troubleshooting
+## 🔧 Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
-| "Startup failed" | Run `pip install foundry-local-sdk` or `winget install Microsoft.FoundryLocal` |
-| "No models found" | Download a model in AI Toolkit  Models  Download, then click  |
-| Model not responding | Click  to retry; if stuck, close and reopen the app |
-| Slow first load | Large models (67 GB) can take 23 min; subsequent loads are faster |
+| "Could not reach Ollama" | Make sure Ollama is running: `ollama serve` |
+| "No models found" (Ollama) | Pull a model first: `ollama pull llama3.2` |
+| "Could not start Foundry Local" | `winget install Microsoft.FoundryLocal` |
+| "No models found" (Foundry) | Download a model via **AI Toolkit → Models → Download** |
+| Model not responding | Click ↻ to retry the health check |
+| Slow first response (Ollama) | Normal — Ollama loads the model on the first inference call |
+| Slow first load (Foundry) | Large models (6–7 GB) can take 2–3 min; subsequent loads are faster |
 
 ---
 
-##  Building the Executable
+## 🔨 Building the Executable
 
 ```powershell
+# Generate the BitDog icon first
+python make_icon.py
+
+# Build the single-file .exe
 pip install pyinstaller
-pyinstaller ProjectVera.spec
-# Output: dist\ProjectVera.exe
+pyinstaller ProjectVera.spec --noconfirm
+
+# Output
+.\dist\ProjectVera.exe
 ```
 
 ---
 
-##  Repository Layout
+## 📁 Repository Layout
 
 ```
 .
- app.py              # Single-file application (~2,300 lines)
- ProjectVera.spec    # PyInstaller build spec
- requirements.txt    # Python dependencies
- Logo/
-    icon.ico        # App icon (taskbar + window)
-    *.png           # Source artwork
- README.md
+├── app.py                  # Single-file application (~2 800 lines)
+├── make_icon.py            # Generates Logo/bitdog.ico from the BitDog sprite
+├── ProjectVera.spec        # PyInstaller build spec
+├── Logo/
+│   ├── bitdog.ico          # Generated multi-resolution app icon
+│   ├── Foundry local logo.png
+│   ├── Ollama logo.png
+│   └── *.png               # Other source artwork
+└── README.md
 ```
 
 ---
 
-##  Privacy & Security
+## 🔒 Privacy & Security
 
--  Zero cloud dependency  all data stays on your PC
--  Zero telemetry  no tracking, no analytics
--  Open source  inspect the code yourself
--  Local-only inference  models run on your hardware
+- ✅ Zero cloud dependency — all data stays on your PC
+- ✅ Zero telemetry — no tracking, no analytics
+- ✅ Open source — inspect every line
+- ✅ Local-only inference — models run entirely on your hardware
 
 ---
 
-##  Contributing
+## 🤝 Contributing
 
-Personal project  feel free to fork and adapt!
+Personal project — feel free to fork and adapt!
 
 **Known limitations:**
 - Windows only (uses ctypes Win32 API for window chrome and resize)
-- Requires Foundry Local (Microsoft's local inference runtime)
+- Requires either Foundry Local or Ollama to be installed and running
 
 ---
 
-##  License
+## 📄 License
 
-Apache 2.0  see LICENSE file for details.
+Apache 2.0 — see LICENSE file for details.
 
 ---
 
-##  Acknowledgments
+## 🙏 Acknowledgments
 
-- **Microsoft Foundry Local**  local inference runtime
-- **PySide6**  Qt bindings for Python
+- **Microsoft Foundry Local** — local inference runtime
+- **Ollama** — lightweight local model serving
+- **PySide6** — Qt6 bindings for Python
+- **openai-python** — OpenAI-compatible client used for both backends
+
 - **OpenAI SDK**  OpenAI-compatible chat completions
 - **pypdf**  PDF parsing
 

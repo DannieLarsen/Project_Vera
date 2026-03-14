@@ -1,6 +1,6 @@
 """
 Project Vera — Local AI Desktop Chatbot
-Powered by Microsoft Foundry Local
+Powered by Foundry Local or Ollama (user's choice)
 License: Apache 2.0 (no cost, no cloud)
 """
 
@@ -13,6 +13,7 @@ import time
 import sqlite3
 import uuid
 import json
+import urllib.request
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,22 +28,24 @@ if sys.platform == "win32":
         pass
 
 from PySide6.QtCore import Qt, QEvent, Signal, QObject, QThread, QPoint, QRect, QTimer, QPropertyAnimation, QEasingCurve, QSize
-from PySide6.QtGui import QFont, QColor, QPalette, QTextCursor, QIcon, QPainter
+from PySide6.QtGui import QFont, QColor, QPalette, QTextCursor, QIcon, QPainter, QPixmap, QPainterPath
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QTextEdit, QLineEdit, QPushButton,
     QLabel, QSizePolicy, QScrollArea, QFrame, QGraphicsDropShadowEffect,
     QComboBox, QListWidget, QListWidgetItem, QSplitter, QMenu, QInputDialog,
-    QMessageBox
+    QMessageBox, QStackedWidget
 )
 from openai import OpenAI
 
-# ── Foundry Local connection ──────────────────────────────────────────────────
-# Port is dynamic — discovered at runtime via foundry-local-sdk.
+# ── Backend connection defaults ──────────────────────────────────────────────
+# Foundry: port is dynamic (discovered via SDK).  Ollama: fixed port 11434.
 MODEL_NAME = "qwen2.5-1.5b-instruct-generic-cpu:1"  # fallback only
+OLLAMA_ENDPOINT = "http://localhost:11434/v1"
+OLLAMA_API_KEY  = "ollama"  # Ollama accepts any non-empty string
 
 SYSTEM_PROMPT = (
-    "You are a helpful, concise AI assistant named James. "
+    "You are a helpful, concise AI assistant named Vera. "
     "Answer clearly and accurately. "
     "Use markdown for code blocks when relevant."
 )
@@ -88,6 +91,70 @@ def _save_config(cfg: dict):
         _CFG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     except Exception:
         pass
+
+
+# ── BitDog icon renderer ────────────────────────────────────────────────────────────
+def _render_bitdog_head(size: int) -> QPixmap:
+    """Render the front-facing BitDog head (ears up) into a `size`×`size` QPixmap.
+    Includes a rounded-rect background styled like a modern app icon."""
+    _SPRITE = [
+        [0,1,1,0,0,0,0,0,0,0,1,1,0],
+        [0,1,1,0,0,0,0,0,0,0,1,1,0],
+        [0,1,1,1,1,1,1,1,1,1,1,1,0],
+        [0,0,1,1,1,1,1,1,1,1,1,0,0],
+        [0,0,1,3,1,1,1,1,1,3,1,0,0],
+        [0,0,1,1,1,1,1,1,1,1,1,0,0],
+        [0,0,1,1,1,2,2,2,1,1,1,0,0],
+        [0,0,0,1,1,1,1,1,1,1,0,0,0],
+        [0,0,0,0,1,1,1,1,1,0,0,0,0],
+        [0,0,0,0,0,0,0,0,0,0,0,0,0],
+    ]
+    W, H       = 13, 10
+    col_body   = QColor(ACCENT)
+    col_dark   = QColor(ACCENT).darker(180)
+    col_eye    = QColor("#d8d8d8")
+    col_bg     = QColor(BG_PANEL)
+
+    # Cell size: fill ~78 % of the icon canvas so padding looks balanced
+    cell = max(1, (size * 78 // 100) // W)
+    sprite_w = W * cell
+    sprite_h = H * cell
+    x_off    = (size - sprite_w) // 2
+    y_off    = (size - sprite_h) // 2
+
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+
+    # Rounded background (22 % corner radius — matches macOS/Win11 icon style)
+    radius = max(2, size * 22 // 100)
+    path   = QPainterPath()
+    path.addRoundedRect(0, 0, size, size, radius, radius)
+    p.fillPath(path, col_bg)
+
+    # Draw sprite pixels
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+    for r, row in enumerate(_SPRITE):
+        for c, cell_val in enumerate(row):
+            if cell_val == 0:
+                continue
+            color = col_body if cell_val == 1 else col_dark if cell_val == 2 else col_eye
+            p.fillRect(x_off + c * cell, y_off + r * cell, cell, cell, color)
+    p.end()
+    return pix
+
+
+def _make_bitdog_icon() -> QIcon:
+    """Build a QIcon with the BitDog head rendered at all standard sizes."""
+    icon = QIcon()
+    for s in (16, 24, 32, 48, 64, 128, 256):
+        try:
+            icon.addPixmap(_render_bitdog_head(s))
+        except Exception:
+            pass
+    return icon
 
 
 # ── Database worker ───────────────────────────────────────────────────────────
@@ -401,10 +468,80 @@ class FoundryManager(QObject):
         self.unload_model()
 
 
+# ── Ollama manager ────────────────────────────────────────────────────────────
+class OllamaManager(QObject):
+    """Connects to a locally-running Ollama service.
+    Ollama exposes a fixed OpenAI-compatible endpoint at port 11434."""
+    status_update = Signal(str, str)   # (text, colour)
+    ready         = Signal()
+    failed        = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.endpoint: str = OLLAMA_ENDPOINT
+        self.api_key:  str = OLLAMA_API_KEY
+        self.model:    str = ""          # last-used model name
+
+    # ── called in a QThread ──────────────────────────────────────────────────
+    def start_ollama(self):
+        """Verify Ollama is reachable — it runs as its own process."""
+        self.status_update.emit("● Connecting to Ollama…", "#e8660a")
+        try:
+            req = urllib.request.Request(
+                "http://localhost:11434/api/tags",
+                headers={"Accept": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                resp.read()
+        except Exception as e:
+            self.failed.emit(
+                f"Could not reach Ollama at localhost:11434\n\n"
+                f"Make sure Ollama is running:\n"
+                f"  winget install Ollama.Ollama\n"
+                f"  ollama serve\n\nDetail: {e}"
+            )
+            return
+        self.ready.emit()
+
+    def list_cached(self) -> list:
+        """Return list of (name, name) tuples for all locally pulled models."""
+        try:
+            req = urllib.request.Request(
+                "http://localhost:11434/api/tags",
+                headers={"Accept": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read())
+            return [(m["name"], m["name"]) for m in data.get("models", [])]
+        except Exception:
+            return []
+
+    def load_model(self, name: str):
+        """Ollama auto-loads on first inference — nothing to do."""
+        self.model = name
+
+    def unload_model(self):
+        """Ollama manages its own lifecycle — nothing to do."""
+        self.model = ""
+
+    def stop_foundry(self):
+        """No-op: Ollama is not managed by this app."""
+        pass
+
+
 # ── Model name display helper ─────────────────────────────────────────────────
 def _model_display_name(alias_or_id: str) -> str:
-    """Convert a Foundry alias or model ID to a short display name.
-    e.g. 'qwen2.5-7b' → 'Qwen2.5-7b'  (aliases are already short)."""
+    """Convert a model alias/ID to a short display name.
+    Handles both Foundry suffixes and Ollama 'name:tag' format."""
+    # Ollama style:  llama3.2:3b  →  Llama3.2 (3b)
+    if ":" in alias_or_id and not alias_or_id.startswith("http"):
+        tag_part = alias_or_id.split(":", 1)[-1]
+        # Only treat as Ollama tag if it doesn't look like a Foundry version ":1"
+        if not re.match(r"^\d+$", tag_part):
+            base = alias_or_id.split(":", 1)[0]
+            base = base[:1].upper() + base[1:]
+            return f"{base} ({tag_part})"
+    # Foundry style: strip suffixes
     name = re.sub(r":\d+$", "", alias_or_id)
     name = re.sub(r"-generic-(?:cpu|gpu)", "", name, flags=re.IGNORECASE)
     name = re.sub(r"-instruct$", "", name, flags=re.IGNORECASE)
@@ -413,44 +550,58 @@ def _model_display_name(alias_or_id: str) -> str:
 
 # ── Model list worker ─────────────────────────────────────────────────────────
 class ModelListWorker(QObject):
-    """Discovers all models cached locally via the foundry-local-sdk."""
+    """Discovers all locally available models from whichever manager is active."""
     models_ready = Signal(list)   # list of (alias, model_id) tuples
 
-    def __init__(self, fm: FoundryManager):
+    def __init__(self, manager):
         super().__init__()
-        self._fm = fm
+        self._manager = manager
 
     def run(self):
-        models: list[tuple[str, str]] = []
         try:
-            for m in self._fm.list_cached():
-                models.append((m.alias, m.id))
+            result = self._manager.list_cached()
+            # FoundryManager returns objects with .alias / .id;
+            # OllamaManager already returns (name, name) tuples.
+            models = []
+            for item in result:
+                if isinstance(item, tuple):
+                    models.append(item)
+                else:
+                    models.append((item.alias, item.id))
         except Exception:
-            pass
+            models = []
         self.models_ready.emit(models)
 
 
 # ── Model switch worker ───────────────────────────────────────────────────────
 class ModelSwitchWorker(QObject):
-    """Unloads the current model and loads a new one via the SDK."""
+    """Switches models.  For Foundry: unloads old + loads new.  For Ollama: instant."""
     status_update = Signal(str, str)
     done          = Signal(str)   # emits the new model alias on success
     failed        = Signal(str)
 
-    def __init__(self, fm: FoundryManager, old_model: str, new_model: str):
+    def __init__(self, manager, old_model: str, new_model: str):
         super().__init__()
-        self._fm        = fm
+        self._manager   = manager
         self._old_model = old_model
         self._new_model = new_model
 
     def run(self):
+        is_ollama = isinstance(self._manager, OllamaManager)
+        if is_ollama:
+            # Ollama auto-loads on first inference call
+            self.status_update.emit("● Selecting model…", "#e8660a")
+            self._manager.load_model(self._new_model)
+            self.done.emit(self._new_model)
+            return
+
         if self._old_model:
             self.status_update.emit("● Stopping current model…", "#e8660a")
-            self._fm.unload_model()
+            self._manager.unload_model()
 
         self.status_update.emit("● Loading model…", "#e8660a")
         try:
-            self._fm.load_model(self._new_model)
+            self._manager.load_model(self._new_model)
         except Exception as e:
             self.failed.emit(f"Could not load '{self._new_model}': {e}")
             return
@@ -516,7 +667,7 @@ class StreamWorker(QObject):
                     err = ("Model stopped responding (timeout).\n"
                            "The file may be too large. Try a smaller excerpt.")
                 elif self._is_transient(err):
-                    err = ("Foundry Local dropped the connection.\n"
+                    err = ("The local AI service dropped the connection.\n"
                            "The model may have run out of memory.\n"
                            "Try with a smaller file or shorter prompt.")
                 self.error_occurred.emit(err)
@@ -900,49 +1051,128 @@ class ChatWindow(QMainWindow):
         self._setup_ui()
         self._apply_theme()
         self._restore_config()
-        self._start_foundry()
+        # Show picker or auto-start from saved config
+        saved = _load_config().get("backend", "")
+        if saved in ("foundry", "ollama"):
+            self._on_backend_chosen(saved, remember=False)
+        else:
+            self._stack.setCurrentIndex(0)  # show picker
 
-    # ── Foundry lifecycle ─────────────────────────────────────────────────────
-    def _start_foundry(self):
-        """Launch Foundry service; model is loaded when the user selects one."""
+    # ── Backend picker ────────────────────────────────────────────────────────
+    def _on_backend_chosen(self, backend: str, remember: bool = True):
+        """Called when the user clicks a backend card (or auto-starts from config)."""
+        self._chosen_backend = backend
+        if remember:
+            cfg = _load_config()
+            cfg["backend"] = backend
+            _save_config(cfg)
+        # Switch to the main chat page immediately
+        self._stack.setCurrentIndex(1)
+        # Show the correct badge in the title bar
+        self._backend_badge.setText("Foundry" if backend == "foundry" else "Ollama")
+        self._backend_badge.setToolTip(
+            "Click to switch backend (restarts the service)"
+        )
+        self._backend_badge.show()
+        self._start_backend(backend)
+
+    def _switch_backend(self):
+        """Go back to the picker screen so the user can choose a different backend."""
+        # Stop any active streaming
+        if self._worker is not None:
+            self._worker.stop()
+        # Clean up old manager
+        if hasattr(self, '_fm'):
+            try:
+                t = threading.Thread(target=self._fm.stop_foundry, daemon=True)
+                t.start()
+                t.join(timeout=5)
+            except Exception:
+                pass
+        self.client = None
+        self._active_model = ""
+        self._active_model_id = ""
+        self.model_combo.hide()
+        self.model_combo.clear()
+        self.retry_btn.hide()
+        self._backend_badge.hide()
+        self.status_label.setText("● Connecting…")
+        self.status_label.setStyleSheet(
+            f"color: {TEXT_MUTED}; font-size: 11px; background: transparent;"
+        )
+        self._stack.setCurrentIndex(0)
+
+    # ── Backend lifecycle ─────────────────────────────────────────────────────
+    def _start_backend(self, backend: str):
+        """Instantiate the chosen manager and start it in a background thread."""
+        self.retry_btn.hide()
+        self.model_combo.hide()
+        self.status_label.setText("● Connecting…")
+        self.status_label.setStyleSheet(
+            f"color: {TEXT_MUTED}; font-size: 11px; background: transparent;"
+        )
         self._fm_thread = QThread()
-        self._fm = FoundryManager()
+        if backend == "ollama":
+            self._fm = OllamaManager()
+            self._fm_thread.started.connect(self._fm.start_ollama)
+        else:
+            self._fm = FoundryManager()
+            self._fm_thread.started.connect(self._fm.start_foundry)
         self._fm.moveToThread(self._fm_thread)
-        self._fm_thread.started.connect(self._fm.start_foundry)
-        self._fm.status_update.connect(self._on_foundry_status)
-        self._fm.ready.connect(self._on_foundry_ready)
-        self._fm.failed.connect(self._on_foundry_failed)
+        self._fm.status_update.connect(self._on_backend_status)
+        self._fm.ready.connect(self._on_backend_ready)
+        self._fm.failed.connect(self._on_backend_failed)
         self._fm.ready.connect(self._fm_thread.quit)
         self._fm.failed.connect(self._fm_thread.quit)
         self._fm_thread.finished.connect(self._fm_thread.deleteLater)
         self._fm_thread.start()
 
-    def _on_foundry_status(self, text: str, colour: str):
+    # Keep old name as alias so _retry_connection and _on_disconnected still work
+    def _start_foundry(self):
+        backend = getattr(self, '_chosen_backend', 'foundry')
+        self._start_backend(backend)
+
+    def _on_backend_status(self, text: str, colour: str):
         self.status_label.setText(text)
         self.status_label.setStyleSheet(
             f"color: {colour}; font-size: 11px; background: transparent;"
         )
 
-    def _on_foundry_ready(self):
-        # Create the OpenAI client now that the SDK has discovered the port
+    # Keep old alias for HealthCheckWorker signal connection
+    def _on_foundry_status(self, text: str, colour: str):
+        self._on_backend_status(text, colour)
+
+    def _on_backend_ready(self):
         self.client = OpenAI(
             base_url=self._fm.endpoint,
             api_key=self._fm.api_key,
         )
-        # Populate the model list; model loads when the user picks one
         self._populate_model_combo()
         self.status_label.setText("● Select a model to begin")
         self.status_label.setStyleSheet(
             f"color: {TEXT_MUTED}; font-size: 11px; background: transparent;"
         )
 
-    def _on_foundry_failed(self, msg: str):
+    # Keep old alias
+    def _on_foundry_ready(self):
+        self._on_backend_ready()
+
+    def _on_backend_failed(self, msg: str):
         self.status_label.setText("● Startup failed")
         self.status_label.setStyleSheet(
             "color: #e53935; font-size: 11px; background: transparent;"
         )
         self.retry_btn.setToolTip(msg)
+        try:
+            self.retry_btn.clicked.disconnect()
+        except Exception:
+            pass
+        self.retry_btn.clicked.connect(self._start_foundry)
         self.retry_btn.show()
+
+    # Keep old alias
+    def _on_foundry_failed(self, msg: str):
+        self._on_backend_failed(msg)
 
     def _check_connection(self):
         self.status_label.setText("● Connecting…")
@@ -971,25 +1201,24 @@ class ChatWindow(QMainWindow):
         self.send_btn.setEnabled(True)  # safe for both startup and post-switch
 
     def _on_disconnected(self):
+        backend_name = "Ollama" if self._is_ollama() else "Foundry Local"
         if self._active_model:
-            # A model was chosen but the endpoint never warmed up.
             self.status_label.setText("● Model not responding — click ↻ to retry")
             self.status_label.setStyleSheet(f"color: #e53935; font-size: 11px; background: transparent;")
             self.retry_btn.setToolTip(
-                f"The inference endpoint for '{self._active_model}' did not respond\n"
-                "within 60 s. Click to try warming it up again."
+                f"The inference endpoint for '{self._active_model}' did not respond.\n"
+                "Click to try warming it up again."
             )
-            # Retry should re-run the health check, NOT restart the whole service
             try:
                 self.retry_btn.clicked.disconnect()
             except Exception:
                 pass
             self.retry_btn.clicked.connect(self._retry_connection)
         else:
-            self.status_label.setText("● Foundry Local not running")
+            self.status_label.setText(f"● {backend_name} not running")
             self.status_label.setStyleSheet(f"color: #e53935; font-size: 11px; background: transparent;")
             self.retry_btn.setToolTip(
-                "Foundry Local service is not reachable.\n"
+                f"{backend_name} service is not reachable.\n"
                 "Click here to try starting it again."
             )
             try:
@@ -1003,6 +1232,10 @@ class ChatWindow(QMainWindow):
         """Re-run just the health check without restarting the whole service."""
         self.retry_btn.hide()
         self._check_connection()
+
+    # ── Ollama first-token load awareness ─────────────────────────────────────
+    def _is_ollama(self) -> bool:
+        return isinstance(getattr(self, '_fm', None), OllamaManager)
 
     # ── Config save / restore ─────────────────────────────────────────────────
     def _restore_config(self):
@@ -1224,7 +1457,7 @@ class ChatWindow(QMainWindow):
 
     # ── Model switcher ────────────────────────────────────────────────────────
     def _populate_model_combo(self):
-        """Fetch available models from the SDK and populate the combo box."""
+        """Fetch available models from the active backend and populate the combo box."""
         self._ml_thread = QThread()
         self._ml_worker = ModelListWorker(self._fm)
         self._ml_worker.moveToThread(self._ml_thread)
@@ -1252,15 +1485,23 @@ class ChatWindow(QMainWindow):
             self.model_combo.show()
         else:
             self.model_combo.blockSignals(False)
-            self.status_label.setText("● No models found — download one in AI Toolkit")
+            if self._is_ollama():
+                msg  = "● No models found — pull one with: ollama pull <model>"
+                tip  = "No models found in Ollama.\nRun: ollama pull llama3.2\nthen click ↻."
+            else:
+                msg  = "● No models found — download one in AI Toolkit"
+                tip  = "No models found in Foundry cache.\nDownload via AI Toolkit → Models, then click ↻."
+            self.status_label.setText(msg)
             self.status_label.setStyleSheet(
                 "color: #e53935; font-size: 11px; background: transparent;"
             )
+            try:
+                self.retry_btn.clicked.disconnect()
+            except Exception:
+                pass
+            self.retry_btn.clicked.connect(self._start_foundry)
             self.retry_btn.show()
-            self.retry_btn.setToolTip(
-                "No models found in Foundry cache.\n"
-                "Download a model via AI Toolkit → Models, then click ↻."
-            )
+            self.retry_btn.setToolTip(tip)
 
     def _on_model_combo_changed(self, display_name: str):
         if display_name == "— Select model —":
@@ -1273,7 +1514,7 @@ class ChatWindow(QMainWindow):
         self.send_btn.setEnabled(False)
         self.model_combo.setEnabled(False)
         self._sw_thread = QThread()
-        self._sw_worker = ModelSwitchWorker(self._fm, self._active_model, new_model)
+        self._sw_worker = ModelSwitchWorker(self._fm, self._active_model, new_model)  # works for both managers
         self._sw_worker.moveToThread(self._sw_thread)
         self._sw_thread.started.connect(self._sw_worker.run)
         self._sw_worker.status_update.connect(self._on_foundry_status)
@@ -1290,7 +1531,7 @@ class ChatWindow(QMainWindow):
         self._active_model = new_model
         # Resolve the full model ID for use in chat completions
         self._active_model_id = self._id_map.get(new_model, new_model)
-        self._fm.model = new_model  # keep FoundryManager in sync for graceful shutdown
+        self._fm.model = new_model  # keep manager in sync for graceful shutdown
         # Remove the "— Select model —" placeholder on first successful load
         placeholder_idx = self.model_combo.findText("— Select model —")
         if placeholder_idx >= 0:
@@ -1301,9 +1542,16 @@ class ChatWindow(QMainWindow):
                 self.model_combo.setCurrentIndex(idx)
             self.model_combo.blockSignals(False)
         self.model_combo.setEnabled(True)
-        # Leave send_btn disabled — _check_connection enables it only once the
-        # inference endpoint for the new model is actually warm.
-        self._check_connection()
+        if self._is_ollama():
+            # Ollama auto-loads on first token — mark as ready immediately
+            self.status_label.setText("● Ready  (model loads on first message)")
+            self.status_label.setStyleSheet(
+                f"color: #4caf50; font-size: 11px; background: transparent;"
+            )
+            self.send_btn.setEnabled(True)
+        else:
+            # Foundry: health-check confirms the inference endpoint is warm
+            self._check_connection()
 
     def _on_switch_failed(self, error: str):
         # Revert the combo to the model that is still actually loaded
@@ -1342,6 +1590,23 @@ class ChatWindow(QMainWindow):
         root.setSpacing(0)
         outer.addWidget(self.container)
 
+        # ── Stacked widget: page 0 = backend picker, page 1 = chat ─────────
+        self._stack = QStackedWidget()
+        self._stack.setStyleSheet("background: transparent;")
+
+        # Page 0: backend picker (built later in _build_backend_picker)
+        picker_page = self._build_backend_picker()
+        self._stack.addWidget(picker_page)   # index 0
+
+        # Page 1: main chat UI (title bar + body, built below)
+        chat_page = QWidget()
+        chat_page.setStyleSheet("background: transparent;")
+        chat_page_layout = QVBoxLayout(chat_page)
+        chat_page_layout.setContentsMargins(0, 0, 0, 0)
+        chat_page_layout.setSpacing(0)
+        self._stack.addWidget(chat_page)     # index 1
+        root.addWidget(self._stack, stretch=1)
+
         # ── Title bar ───────────────────────────────────────────────────────
         self.title_bar = QFrame()
         self.title_bar.setFixedHeight(48)
@@ -1376,7 +1641,7 @@ class ChatWindow(QMainWindow):
         self.retry_btn = QPushButton("↻")
         self.retry_btn.setFixedSize(26, 26)
         self.retry_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.retry_btn.setToolTip("Retry: start Foundry service and load model")
+        self.retry_btn.setToolTip("Retry connecting to the AI backend")
         self.retry_btn.setStyleSheet(f"""
             QPushButton {{
                 background: transparent; border: none;
@@ -1462,11 +1727,31 @@ class ChatWindow(QMainWindow):
         """)
         self._burger_btn.clicked.connect(self._toggle_sidebar)
 
+        # Backend badge button — shown once a backend is chosen
+        self._backend_badge = QPushButton()
+        self._backend_badge.setFixedHeight(22)
+        self._backend_badge.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._backend_badge.setStyleSheet(f"""
+            QPushButton {{
+                background-color: rgba(232,102,10,0.15);
+                color: {ACCENT}; border: 1px solid {ACCENT};
+                border-radius: 5px; font-size: 10px; font-weight: 700;
+                padding: 0 8px;
+            }}
+            QPushButton:hover {{
+                background-color: rgba(232,102,10,0.30);
+            }}
+        """)
+        self._backend_badge.clicked.connect(self._switch_backend)
+        self._backend_badge.hide()
+
         h_layout.addWidget(self._burger_btn)
         h_layout.addSpacing(4)
         h_layout.addWidget(title_dog)
         h_layout.addWidget(title)
-        h_layout.addSpacing(12)
+        h_layout.addSpacing(6)
+        h_layout.addWidget(self._backend_badge)
+        h_layout.addSpacing(6)
         h_layout.addWidget(self.model_combo)
         h_layout.addStretch()
         h_layout.addWidget(self.status_label)
@@ -1475,7 +1760,7 @@ class ChatWindow(QMainWindow):
         h_layout.addWidget(min_btn)
         h_layout.addWidget(max_btn)
         h_layout.addWidget(close_btn)
-        root.addWidget(self.title_bar)
+        chat_page_layout.addWidget(self.title_bar)
         title_dog.sit(flip_ms=2000)
 
         # ── Body: sidebar + chat pane ───────────────────────────────────────
@@ -1484,7 +1769,7 @@ class ChatWindow(QMainWindow):
         body_layout = QHBoxLayout(body)
         body_layout.setContentsMargins(0, 0, 0, 0)
         body_layout.setSpacing(0)
-        root.addWidget(body, stretch=1)
+        chat_page_layout.addWidget(body, stretch=1)
 
         # ── Left sidebar ────────────────────────────────────────────────────
         self._sidebar = QFrame()
@@ -1745,6 +2030,251 @@ class ChatWindow(QMainWindow):
             m = 12  # matches the outer shadow-bleed margin
             self._drop_overlay.setGeometry(m, m, self.width() - 2 * m, self.height() - 2 * m)
 
+    # ── Backend picker page ───────────────────────────────────────────────────
+    def _build_backend_picker(self) -> QWidget:
+        """Build the full-size backend selection screen shown on first launch
+        (or when the user clicks the backend badge to switch)."""
+        page = QWidget()
+        page.setStyleSheet(f"""
+            QWidget {{
+                background-color: {BG_MAIN};
+                border-radius: 10px;
+            }}
+        """)
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # ── Slim top bar (drag + window controls only, no status/model) ──────
+        top_bar = QFrame()
+        top_bar.setFixedHeight(48)
+        top_bar.setStyleSheet(
+            f"background-color: {BG_PANEL}; "
+            f"border-bottom: 1px solid {BORDER}; "
+            f"border-top-left-radius: 10px; "
+            f"border-top-right-radius: 10px;"
+        )
+        top_bar.mousePressEvent       = self._tb_mouse_press
+        top_bar.mouseMoveEvent        = self._tb_mouse_move
+        top_bar.mouseDoubleClickEvent = self._tb_double_click
+
+        tb_layout = QHBoxLayout(top_bar)
+        tb_layout.setContentsMargins(16, 0, 8, 0)
+        tb_layout.setSpacing(8)
+
+        picker_dog = BitDogWidget()
+        picker_dog.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        picker_dog.setFixedWidth(46)
+
+        picker_title = QLabel("Project Vera")
+        picker_title.setStyleSheet(
+            f"color: {TEXT_PRIMARY}; font-size: 14px; font-weight: 700; background: transparent;"
+        )
+
+        def _pb(size: str) -> str:
+            return f"""
+                QPushButton {{
+                    background: transparent; border: none; color: {ACCENT};
+                    font-size: {size};
+                    min-width: 30px; max-width: 30px;
+                    min-height: 30px; max-height: 30px;
+                    border-radius: 6px; padding: 0;
+                }}
+                QPushButton:hover {{ background-color: rgba(232,102,10,0.15); }}
+            """
+
+        p_min = QPushButton("⎯")
+        p_min.setStyleSheet(_pb("15px"))
+        p_min.setCursor(Qt.CursorShape.PointingHandCursor)
+        p_min.setToolTip("Minimize")
+        p_min.clicked.connect(self.showMinimized)
+
+        p_max = QPushButton("□")
+        p_max.setStyleSheet(_pb("16px"))
+        p_max.setCursor(Qt.CursorShape.PointingHandCursor)
+        p_max.setToolTip("Maximise")
+        p_max.clicked.connect(self._toggle_maximise)
+
+        p_close = QPushButton("✕")
+        p_close.setStyleSheet(
+            _pb("14px") +
+            "QPushButton:hover { background-color: #c0392b; color: #ffffff; }"
+        )
+        p_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        p_close.setToolTip("Close")
+        p_close.clicked.connect(self.close)
+
+        tb_layout.addWidget(picker_dog)
+        tb_layout.addWidget(picker_title)
+        tb_layout.addStretch()
+        tb_layout.addWidget(p_min)
+        tb_layout.addWidget(p_max)
+        tb_layout.addWidget(p_close)
+        outer.addWidget(top_bar)
+        picker_dog.sit(flip_ms=2000)
+
+        # ── Center content ───────────────────────────────────────────────────
+        center = QWidget()
+        center.setStyleSheet(f"""
+            QWidget {{
+                background-color: {BG_MAIN};
+                border-bottom-left-radius: 10px;
+                border-bottom-right-radius: 10px;
+            }}
+        """)
+        center_layout = QVBoxLayout(center)
+        center_layout.setContentsMargins(40, 40, 40, 40)
+        center_layout.setSpacing(0)
+        outer.addWidget(center, stretch=1)
+
+        headline = QLabel("Where should we begin?")
+        headline.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        headline.setWordWrap(True)
+        headline.setStyleSheet(
+            f"color: {ACCENT}; font-size: 42px; font-weight: 700; "
+            "background: transparent; padding-bottom: 10px;"
+        )
+        center_layout.addStretch(1)
+        center_layout.addWidget(headline)
+
+        sub = QLabel("Choose a local AI backend to get started")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub.setStyleSheet(
+            f"color: {TEXT_MUTED}; font-size: 14px; background: transparent; padding-bottom: 40px;"
+        )
+        center_layout.addWidget(sub)
+
+        # ── Card row ─────────────────────────────────────────────────────────
+        card_row = QHBoxLayout()
+        card_row.setContentsMargins(0, 0, 0, 0)
+        card_row.setSpacing(40)
+        center_layout.addLayout(card_row)
+        card_row.addStretch(1)
+        card_row.addWidget(self._make_backend_card("foundry"))
+        card_row.addWidget(self._make_backend_card("ollama"))
+        card_row.addStretch(1)
+
+        hint = QLabel("Your choice is saved and can be changed at any time")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint.setStyleSheet(
+            f"color: {TEXT_MUTED}; font-size: 11px; background: transparent; padding-top: 32px;"
+        )
+        center_layout.addWidget(hint)
+        center_layout.addStretch(2)
+
+        return page
+
+    def _make_backend_card(self, backend: str) -> QFrame:
+        """Return a clickable card for the given backend ('foundry' or 'ollama')."""
+        _LOGO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Logo")
+        if backend == "foundry":
+            logo_file  = os.path.join(_LOGO_DIR, "Foundry local logo.png")
+            label_text = "Foundry Local"
+            sub_text   = "Microsoft AI Toolkit"
+        else:
+            logo_file  = os.path.join(_LOGO_DIR, "Ollama logo.png")
+            label_text = "Ollama"
+            sub_text   = "ollama.com"
+
+        card = QFrame()
+        card.setObjectName(f"card_{backend}")
+        card.setFixedSize(200, 210)
+        card.setCursor(Qt.CursorShape.PointingHandCursor)
+        card.setStyleSheet(f"""
+            QFrame#card_{backend} {{
+                background-color: {BG_PANEL};
+                border: 1px solid {BORDER};
+                border-radius: 14px;
+            }}
+            QFrame#card_{backend}:hover {{
+                border: 1px solid {ACCENT};
+                background-color: #2a2a2a;
+            }}
+        """)
+
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(20, 24, 20, 20)
+        layout.setSpacing(10)
+        layout.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+
+        # Logo image — dark-tinted to blend with the near-black background
+        logo_label = QLabel()
+        logo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo_label.setStyleSheet("background: transparent;")
+        logo_label.setFixedSize(100, 72)
+        if os.path.exists(logo_file):
+            pix = QPixmap(logo_file)
+            if not pix.isNull():
+                # Scale to fit within 100×72, keep aspect ratio
+                pix = pix.scaled(
+                    100, 72,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation
+                )
+                # Blend toward the panel background for visual cohesion:
+                # paint a semi-transparent dark overlay on top of the image
+                blended = QPixmap(pix.size())
+                blended.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(blended)
+                painter.drawPixmap(0, 0, pix)
+                # 45 % dark overlay → mutes bright whites/colours to match the theme
+                painter.fillRect(
+                    blended.rect(),
+                    QColor(26, 26, 26, 115)    # #1a1a1a at ~45 % alpha
+                )
+                painter.end()
+                logo_label.setPixmap(blended)
+        else:
+            # Fallback: large emoji / text if the file is missing
+            fb_text = "🤖" if backend == "foundry" else "🦙"
+            logo_label.setText(fb_text)
+            logo_label.setStyleSheet(
+                f"font-size: 48px; background: transparent; color: {TEXT_MUTED};"
+            )
+        layout.addWidget(logo_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+        name_lbl = QLabel(label_text)
+        name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        name_lbl.setStyleSheet(
+            f"color: {TEXT_PRIMARY}; font-size: 15px; font-weight: 700; "
+            "background: transparent;"
+        )
+        layout.addWidget(name_lbl)
+
+        sub_lbl = QLabel(sub_text)
+        sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub_lbl.setStyleSheet(
+            f"color: {TEXT_MUTED}; font-size: 11px; background: transparent;"
+        )
+        layout.addWidget(sub_lbl)
+
+        layout.addStretch()
+
+        choose_btn = QPushButton("Select")
+        choose_btn.setFixedHeight(32)
+        choose_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        choose_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: transparent;
+                color: {ACCENT}; border: 1px solid {ACCENT};
+                border-radius: 7px; font-size: 12px; font-weight: 600;
+            }}
+            QPushButton:hover {{
+                background-color: rgba(232,102,10,0.20);
+                color: {ACCENT_HOVER};
+            }}
+            QPushButton:pressed {{
+                background-color: rgba(232,102,10,0.35);
+            }}
+        """)
+        choose_btn.clicked.connect(lambda: self._on_backend_chosen(backend))
+        layout.addWidget(choose_btn)
+
+        # Also allow clicking anywhere on the card
+        card.mousePressEvent = lambda e, b=backend: self._on_backend_chosen(b)
+
+        return card
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._position_overlay()
@@ -2000,17 +2530,11 @@ class ChatWindow(QMainWindow):
             pass
 
     def _apply_win32_taskbar_icon(self):
-        """Force the correct icon onto the Win32 taskbar button.
+        """Force the BitDog icon onto the Win32 taskbar button.
         Frameless + translucent windows need this done after the event loop
         has processed the show event, otherwise the taskbar button doesn't
         exist yet and the call is a no-op."""
         try:
-            icon_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "Logo", "icon.ico"
-            )
-            if not os.path.exists(icon_path):
-                return
-
             hwnd = int(self.winId())
 
             # 1. Ensure WS_EX_APPWINDOW is set (groups window under our icon,
@@ -2030,10 +2554,23 @@ class ChatWindow(QMainWindow):
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED
             )
 
-            # 3. Load the ICO and send WM_SETICON for both big and small sizes.
-            hicon = ctypes.windll.user32.LoadImageW(
-                None, icon_path, 1,   # IMAGE_ICON
-                0, 0, 0x0010 | 0x0040  # LR_LOADFROMFILE | LR_DEFAULTSIZE
+            # 3. Render BitDog at 256×256, encode as PNG bytes, and create
+            #    an HICON via CreateIconFromResourceEx (supports PNG since Vista).
+            from PySide6.QtCore import QByteArray, QBuffer
+            pix = _render_bitdog_head(256)
+            ba  = QByteArray()
+            buf = QBuffer(ba)
+            buf.open(QBuffer.OpenModeFlag.WriteOnly)
+            pix.save(buf, "PNG")
+            buf.close()
+            png = bytes(ba)
+            arr = (ctypes.c_ubyte * len(png))(*png)
+            hicon = ctypes.windll.user32.CreateIconFromResourceEx(
+                arr, len(png),
+                True,          # fIcon = True (icon, not cursor)
+                0x00030000,    # dwVer
+                0, 0,          # desired cx/cy (0 = use image size)
+                0x0001,        # LR_DEFAULTCOLOR
             )
             if hicon:
                 ctypes.windll.user32.SendMessageW(hwnd, 0x0080, 1, hicon)  # ICON_BIG
@@ -2193,9 +2730,10 @@ class ChatWindow(QMainWindow):
     def _on_error(self, error: str):
         if self._current_bubble:
             self._current_bubble.stop_thinking()
-            endpoint = self._fm.endpoint if hasattr(self, '_fm') else 'unknown'
+            endpoint    = self._fm.endpoint if hasattr(self, '_fm') else 'unknown'
+            backend_lbl = "Ollama" if self._is_ollama() else "Foundry Local"
             self._current_bubble.set_text(
-                f"⚠ Could not reach Foundry Local.\n\n"
+                f"⚠ Could not reach {backend_lbl}.\n\n"
                 f"Endpoint: {endpoint}\n\nError: {error}"
             )
 
@@ -2239,12 +2777,15 @@ class ChatWindow(QMainWindow):
         self.status_label.setText("● Shutting down…")
         QApplication.processEvents()
 
-        # Save window + sidebar state
+        # Save window + sidebar state + backend choice
         sidebar_w = self._sidebar_width if not self._sidebar_collapsed else self._sidebar_width
+        existing  = _load_config()
         _save_config({
-            "window":  {"width": self.width(), "height": self.height()},
-            "sidebar": {"width": sidebar_w, "collapsed": self._sidebar_collapsed},
-            "chat":    {
+            **existing,
+            "backend":  getattr(self, '_chosen_backend', existing.get('backend', '')),
+            "window":   {"width": self.width(), "height": self.height()},
+            "sidebar":  {"width": sidebar_w, "collapsed": self._sidebar_collapsed},
+            "chat":     {
                 "current_session_id": (
                     self._current_session.id if self._current_session else ""
                 )
@@ -2258,7 +2799,7 @@ class ChatWindow(QMainWindow):
             self._db_thread.quit()
             self._db_thread.wait(3000)
 
-        # Unload Foundry model
+        # Clean up active backend (Foundry unloads model; Ollama is a no-op)
         if hasattr(self, '_fm'):
             t = threading.Thread(target=self._fm.stop_foundry, daemon=True)
             t.start()
@@ -2273,15 +2814,12 @@ if __name__ == "__main__":
     app.setApplicationName("Project Vera")
     app.setStyle("Fusion")
 
-    # Set taskbar + window icon
-    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Logo", "icon.ico")
-    if os.path.exists(icon_path):
-        icon = QIcon(icon_path)
-        app.setWindowIcon(icon)
+    # Build the BitDog icon and apply it to the app + window
+    app_icon = _make_bitdog_icon()
+    app.setWindowIcon(app_icon)
 
     window = ChatWindow()
-    if os.path.exists(icon_path):
-        window.setWindowIcon(QIcon(icon_path))
+    window.setWindowIcon(app_icon)
     window.show()
 
     sys.exit(app.exec())
